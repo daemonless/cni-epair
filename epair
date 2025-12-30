@@ -1,0 +1,332 @@
+#!/bin/sh
+#
+# freebsd-epair - CNI plugin for FreeBSD epair/bridge networking
+#
+# This plugin creates epair interfaces and attaches them to bridges,
+# providing macvlan-like functionality for FreeBSD jails/containers.
+#
+# Config options (in CNI config JSON):
+#   bridge: name of bridge to attach to (required)
+#   mtu: MTU for interface (optional, default: 1500)
+#
+# IPAM must provide:
+#   ips[].address: IP address with prefix (e.g., "192.168.86.8/24")
+#   ips[].gateway: gateway address
+#
+# Capabilities:
+#   mac: MAC address assignment
+#   ips: static IP assignment
+
+LOG_FILE="/var/log/cni-freebsd-epair.log"
+
+# Redirect all stderr to log file to avoid polluting podman's parsing
+exec 2>>"$LOG_FILE"
+
+LOCK_FILE="/var/run/cni-freebsd-epair.lock"
+
+log() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') [$$] $*" >> "$LOG_FILE" 2>/dev/null || :
+}
+
+die() {
+    log "ERROR: $1"
+    cat <<EOF
+{
+  "cniVersion": "1.0.0",
+  "code": 100,
+  "msg": "$1"
+}
+EOF
+    exit 1
+}
+
+# Read entire stdin
+read_config() {
+    cat
+}
+
+# Extract JSON value using simple parsing (no jq dependency)
+json_get() {
+    echo "$1" | sed -n "s/.*\"$2\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" | head -1
+}
+
+# Extract nested value like prevResult.interfaces[0].name
+json_get_nested() {
+    echo "$1" | grep -o "\"$2\"[[:space:]]*:[[:space:]]*\"[^\"]*\"" | head -1 | sed 's/.*"\([^"]*\)"$/\1/'
+}
+
+# Get jail ID (numeric JID) from container ID
+get_jail_id() {
+    local container_id="$1"
+    # On FreeBSD with ocijail, CNI_NETNS is the container ID
+    # We need to find the numeric jail ID
+    # Try short match first (first 12 chars), then full
+    local short_id=$(echo "$container_id" | cut -c1-12)
+    local jid=$(jls name jid | grep -E "^${short_id}|^${container_id}" | awk '{print $2}' | head -1)
+    if [ -z "$jid" ]; then
+        # Try matching anywhere in the name
+        jid=$(jls -N name jid 2>/dev/null | grep "$short_id" | awk '{print $NF}' | head -1)
+    fi
+    if [ -z "$jid" ]; then
+        # Last resort - list all and grep
+        jid=$(jls | grep "$short_id" | awk '{print $1}' | head -1)
+    fi
+    echo "$jid"
+}
+
+# Acquire lock for epair creation (avoid race conditions)
+lock() {
+    local i=0
+    while [ $i -lt 10 ]; do
+        if mkdir "$LOCK_FILE" 2>/dev/null; then
+            trap 'rmdir "$LOCK_FILE" 2>/dev/null' EXIT
+            return 0
+        fi
+        sleep 0.1
+        i=$((i + 1))
+    done
+    die "Failed to acquire lock"
+}
+
+unlock() {
+    rmdir "$LOCK_FILE" 2>/dev/null || true
+}
+
+# Track epair for cleanup
+save_epair() {
+    local container_id="$1"
+    local epair_a="$2"
+    local state_dir="/var/run/cni/freebsd-epair"
+    mkdir -p "$state_dir"
+    echo "$epair_a" > "$state_dir/$container_id"
+}
+
+get_epair() {
+    local container_id="$1"
+    local state_dir="/var/run/cni/freebsd-epair"
+    cat "$state_dir/$container_id" 2>/dev/null
+}
+
+del_epair() {
+    local container_id="$1"
+    local state_dir="/var/run/cni/freebsd-epair"
+    rm -f "$state_dir/$container_id" 2>/dev/null
+}
+
+cmd_add() {
+    local config="$1"
+
+    log "ADD: CNI_CONTAINERID=$CNI_CONTAINERID CNI_NETNS=$CNI_NETNS CNI_IFNAME=$CNI_IFNAME CNI_ARGS=$CNI_ARGS"
+    log "ADD: config=$config"
+
+    # Parse config - podman uses "master" for parent interface
+    local bridge=$(json_get "$config" "master")
+    [ -z "$bridge" ] && bridge=$(json_get "$config" "bridge")
+    local mtu=$(json_get "$config" "mtu")
+    [ -z "$mtu" ] && mtu=1500
+
+    # Check for static IP and MAC in CNI_ARGS first (from podman --ip and --mac-address flags)
+    local ip=""
+    local gateway=""
+    local mac=""
+
+    if [ -n "$CNI_ARGS" ]; then
+        ip=$(echo "$CNI_ARGS" | tr ';' '\n' | grep '^IP=' | cut -d= -f2)
+        mac=$(echo "$CNI_ARGS" | tr ';' '\n' | grep '^MAC=' | cut -d= -f2)
+        if [ -n "$ip" ]; then
+            # Add /24 prefix if not present
+            case "$ip" in
+                */*) ;; # Already has prefix
+                *) ip="$ip/24" ;;
+            esac
+            # Extract gateway from subnet (assume .1)
+            gateway=$(echo "$ip" | sed 's|\.[0-9]*/.*|.1|')
+            log "ADD: Using IP from CNI_ARGS: $ip gateway=$gateway"
+        fi
+        if [ -n "$mac" ]; then
+            log "ADD: Using MAC from CNI_ARGS: $mac"
+        fi
+    fi
+
+    # If no IP from args, try IPAM
+    if [ -z "$ip" ]; then
+        local ipam_type=$(echo "$config" | awk -F'"ipam":' '{print $2}' | awk -F'"type":"' '{print $2}' | awk -F'"' '{print $1}')
+        log "ADD: ipam_type=$ipam_type"
+
+        if [ -n "$ipam_type" ] && [ "$ipam_type" != "none" ] && [ "$ipam_type" != "static" ]; then
+            local ipam_result=$(echo "$config" | CNI_COMMAND=ADD /usr/local/libexec/cni/"$ipam_type" 2>/dev/null)
+            log "ADD: ipam_result=$ipam_result"
+            ip=$(echo "$ipam_result" | grep -o '"address"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | sed 's/.*"\([^"]*\)"$/\1/')
+            gateway=$(echo "$ipam_result" | grep -o '"gateway"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | sed 's/.*"\([^"]*\)"$/\1/')
+        fi
+    fi
+
+    # Fall back to MAC from config if not in CNI_ARGS
+    [ -z "$mac" ] && mac=$(json_get "$config" "mac")
+
+    # Validate
+    [ -z "$bridge" ] && die "bridge not specified in config"
+    [ -z "$ip" ] && die "IP address not provided by IPAM"
+
+    # Check bridge exists
+    if ! ifconfig "$bridge" >/dev/null 2>&1; then
+        die "bridge $bridge does not exist"
+    fi
+
+    # Get jail ID
+    local jail_id=$(get_jail_id "$CNI_CONTAINERID")
+    [ -z "$jail_id" ] && die "Could not find jail for container $CNI_CONTAINERID"
+    log "ADD: jail_id=$jail_id"
+
+    # Create epair (with lock to avoid race)
+    lock
+    local epair_a=$(ifconfig epair create)
+    unlock
+
+    local epair_b=$(echo "$epair_a" | sed 's/a$/b/')
+    log "ADD: created $epair_a / $epair_b"
+
+    # Save for cleanup
+    save_epair "$CNI_CONTAINERID" "$epair_a"
+
+    # Configure host side
+    ifconfig "$bridge" addm "$epair_a"
+    ifconfig "$epair_a" up
+
+    # Move to jail
+    ifconfig "$epair_b" vnet "$jail_id" >/dev/null 2>&1
+
+    # Configure jail side (redirect output to avoid polluting stdout)
+    local ifname="${CNI_IFNAME:-eth0}"
+    jexec "$jail_id" ifconfig "$epair_b" name "$ifname" >/dev/null 2>&1
+
+    # Set MAC if provided
+    local actual_mac
+    if [ -n "$mac" ]; then
+        jexec "$jail_id" ifconfig "$ifname" ether "$mac" >/dev/null 2>&1
+        actual_mac="$mac"
+    else
+        actual_mac=$(jexec "$jail_id" ifconfig "$ifname" 2>/dev/null | grep ether | awk '{print $2}')
+    fi
+
+    # Configure IP
+    jexec "$jail_id" ifconfig "$ifname" inet "$ip" >/dev/null 2>&1
+
+    # Add gateway route
+    if [ -n "$gateway" ]; then
+        jexec "$jail_id" route add default "$gateway" >/dev/null 2>&1 || true
+    fi
+
+    # Configure loopback
+    jexec "$jail_id" ifconfig lo0 inet 127.0.0.1/8 >/dev/null 2>&1 || true
+
+    # Get host-side MAC before we output results
+    local host_mac=$(ifconfig "$epair_a" 2>/dev/null | grep ether | awk '{print $2}')
+    local ip_addr=$(echo "$ip" | cut -d/ -f1)
+    local ip_prefix=$(echo "$ip" | cut -d/ -f2)
+
+    log "ADD: success - $ifname=$ip via $bridge host_mac=$host_mac actual_mac=$actual_mac"
+
+    # Output CNI result directly to stdout
+    cat <<EOF
+{
+  "cniVersion": "1.0.0",
+  "interfaces": [
+    {
+      "name": "$epair_a",
+      "mac": "$host_mac"
+    },
+    {
+      "name": "$ifname",
+      "mac": "$actual_mac"
+    }
+  ],
+  "ips": [
+    {
+      "address": "$ip",
+      "gateway": "$gateway",
+      "interface": 1
+    }
+  ]
+}
+EOF
+    log "ADD: completed output"
+    exit 0
+}
+
+cmd_del() {
+    local config="$1"
+
+    log "DEL: CNI_CONTAINERID=$CNI_CONTAINERID"
+
+    # Get saved epair
+    local epair_a=$(get_epair "$CNI_CONTAINERID")
+
+    if [ -n "$epair_a" ]; then
+        # Destroy epair (destroys both ends)
+        ifconfig "$epair_a" destroy 2>/dev/null || true
+        log "DEL: destroyed $epair_a"
+    fi
+
+    del_epair "$CNI_CONTAINERID"
+
+    # Success (even if nothing to clean up)
+    cat <<EOF
+{
+  "cniVersion": "1.0.0"
+}
+EOF
+}
+
+cmd_check() {
+    local config="$1"
+
+    local jail_id=$(get_jail_id "$CNI_CONTAINERID")
+    local ifname="${CNI_IFNAME:-eth0}"
+
+    if [ -z "$jail_id" ]; then
+        die "Container not running"
+    fi
+
+    if ! jexec "$jail_id" ifconfig "$ifname" >/dev/null 2>&1; then
+        die "Interface $ifname not found in jail"
+    fi
+
+    cat <<EOF
+{
+  "cniVersion": "1.0.0"
+}
+EOF
+}
+
+cmd_version() {
+    cat <<EOF
+{
+  "cniVersion": "1.0.0",
+  "supportedVersions": ["0.3.0", "0.3.1", "0.4.0", "1.0.0"]
+}
+EOF
+}
+
+# Main
+log "Called: CNI_COMMAND=$CNI_COMMAND"
+
+config=$(read_config)
+
+case "$CNI_COMMAND" in
+    ADD)
+        cmd_add "$config"
+        ;;
+    DEL)
+        cmd_del "$config"
+        ;;
+    CHECK)
+        cmd_check "$config"
+        ;;
+    VERSION)
+        cmd_version
+        ;;
+    *)
+        die "Unknown CNI command: $CNI_COMMAND"
+        ;;
+esac
