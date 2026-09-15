@@ -1,6 +1,6 @@
 #!/bin/sh
 #
-# freebsd-epair - CNI plugin for FreeBSD epair/bridge networking
+# epair - CNI plugin for FreeBSD epair/bridge networking
 #
 # This plugin creates epair interfaces and attaches them to bridges,
 # providing macvlan-like functionality for FreeBSD jails/containers.
@@ -17,12 +17,14 @@
 #   mac: MAC address assignment
 #   ips: static IP assignment
 
-LOG_FILE="/var/log/cni-freebsd-epair.log"
+# Paths are overridable so the plugin can be exercised outside a real host;
+# the defaults are what production uses and are unchanged.
+LOG_FILE="${CNI_EPAIR_LOG:-/var/log/cni-freebsd-epair.log}"
 
 # Redirect all stderr to log file to avoid polluting podman's parsing
 exec 2>>"$LOG_FILE"
 
-LOCK_FILE="/var/run/cni-freebsd-epair.lock"
+LOCK_FILE="${CNI_EPAIR_LOCK:-/var/run/cni-freebsd-epair.lock}"
 
 log() {
     echo "$(date '+%Y-%m-%d %H:%M:%S') [$$] $*" >> "$LOG_FILE" 2>/dev/null || :
@@ -89,6 +91,10 @@ lock() {
 }
 
 unlock() {
+    # Clear the EXIT trap first. Without this it fires again at exit and
+    # removes whatever lock directory exists by then -- which, under
+    # concurrency, is the one another invocation has just acquired.
+    trap - EXIT
     rmdir "$LOCK_FILE" 2>/dev/null || true
 }
 
@@ -96,20 +102,20 @@ unlock() {
 save_epair() {
     local container_id="$1"
     local epair_a="$2"
-    local state_dir="/var/run/cni/freebsd-epair"
+    local state_dir="${CNI_EPAIR_STATE:-/var/run/cni/freebsd-epair}"
     mkdir -p "$state_dir"
     echo "$epair_a" > "$state_dir/$container_id"
 }
 
 get_epair() {
     local container_id="$1"
-    local state_dir="/var/run/cni/freebsd-epair"
+    local state_dir="${CNI_EPAIR_STATE:-/var/run/cni/freebsd-epair}"
     cat "$state_dir/$container_id" 2>/dev/null
 }
 
 del_epair() {
     local container_id="$1"
-    local state_dir="/var/run/cni/freebsd-epair"
+    local state_dir="${CNI_EPAIR_STATE:-/var/run/cni/freebsd-epair}"
     rm -f "$state_dir/$container_id" 2>/dev/null
 }
 
@@ -189,16 +195,33 @@ cmd_add() {
     # Save for cleanup
     save_epair "$CNI_CONTAINERID" "$epair_a"
 
+    # From here on a failure must not be reported as success: podman would
+    # believe the container holds $ip while it has no working interface at all,
+    # which looks like an application fault rather than a networking one. Each
+    # step that actually builds the network is checked, and the epair we already
+    # created is destroyed before bailing out so a failed ADD leaves nothing
+    # behind on the bridge.
+    fail_add() {
+        log "ADD: FAILED: $1"
+        ifconfig "$epair_a" destroy 2>/dev/null || true
+        del_epair "$CNI_CONTAINERID"
+        die "$1"
+    }
+
     # Configure host side
-    ifconfig "$bridge" addm "$epair_a"
-    ifconfig "$epair_a" up
+    ifconfig "$bridge" addm "$epair_a" 2>/dev/null ||
+        fail_add "could not add $epair_a to bridge $bridge"
+    ifconfig "$epair_a" up 2>/dev/null ||
+        fail_add "could not bring up $epair_a"
 
     # Move to jail
-    ifconfig "$epair_b" vnet "$jail_id" >/dev/null 2>&1
+    ifconfig "$epair_b" vnet "$jail_id" >/dev/null 2>&1 ||
+        fail_add "could not move $epair_b into jail $jail_id"
 
     # Configure jail side (redirect output to avoid polluting stdout)
     local ifname="${CNI_IFNAME:-eth0}"
-    jexec "$jail_id" ifconfig "$epair_b" name "$ifname" >/dev/null 2>&1
+    jexec "$jail_id" ifconfig "$epair_b" name "$ifname" >/dev/null 2>&1 ||
+        fail_add "could not rename $epair_b to $ifname in jail $jail_id"
 
     # Set MAC if provided
     local actual_mac
@@ -209,8 +232,9 @@ cmd_add() {
         actual_mac=$(jexec "$jail_id" ifconfig "$ifname" 2>/dev/null | grep ether | awk '{print $2}')
     fi
 
-    # Configure IP
-    jexec "$jail_id" ifconfig "$ifname" inet "$ip" >/dev/null 2>&1
+    # Configure IP -- the one step whose failure makes the whole result a lie.
+    jexec "$jail_id" ifconfig "$ifname" inet "$ip" >/dev/null 2>&1 ||
+        fail_add "could not set $ip on $ifname in jail $jail_id"
 
     # Add gateway route
     if [ -n "$gateway" ]; then
