@@ -421,6 +421,13 @@ cmd_check() {
 EOF
 }
 
+# Extras beyond the CNI contract, one per line, for a caller that needs to know
+# whether this build can do a thing before offering it. Deliberately not part of
+# the VERSION reply: that schema is CNI's, not ours.
+cmd_features() {
+    echo "dhcp"
+}
+
 cmd_version() {
     cat <<EOF
 {
@@ -447,6 +454,9 @@ case "$CNI_COMMAND" in
         ;;
     VERSION)
         cmd_version
+        ;;
+    FEATURES)
+        cmd_features
         ;;
     *)
         die "Unknown CNI command: $CNI_COMMAND"
