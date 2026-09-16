@@ -1,0 +1,17 @@
+{
+  "cniVersion": "0.4.0",
+  "name": "lan",
+  "plugins": [
+    {
+      "type": "epair",
+      "master": "lanbridge",
+      "mtu": 1500,
+      "ipam": {
+        "type": "host-local",
+        "routes": [{"dst": "0.0.0.0/0"}],
+        "ranges": [[{"subnet": "192.168.86.0/24", "gateway": "192.168.86.1", "rangeStart": "192.168.86.200", "rangeEnd": "192.168.86.250"}]]
+      },
+      "capabilities": {"ips": true, "mac": true}
+    }
+  ]
+}

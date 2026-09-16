@@ -6,36 +6,54 @@ creating an `epair` per container and attaching one end to a host bridge.
 FreeBSD has no macvlan. The bridge + epair pair is the native equivalent, and
 this plugin is what stands in for the upstream `macvlan` plugin on these hosts.
 
-## Installing it as `epair`
+## Creating a network
 
-CNI resolves a network's `type` to a binary of that name in
-`/usr/local/libexec/cni/`, so the plugin is installed as:
-
-```
-/usr/local/libexec/cni/epair
-```
-
-podman will not *create* a network with an unknown driver (`--driver epair`
-fails with "unsupported driver"), but it reads the driver straight from the
-conflist, so the sequence is:
+Write the conflist directly. CNI resolves a network's `type` to a binary of
+that name in `/usr/local/libexec/cni/`, and podman reads every conflist in
+`/usr/local/etc/cni/net.d/`, so the file is the whole interface:
 
 ```sh
-podman network create --driver macvlan --subnet ... --interface-name <bridge> <name>
-sed -i '' 's/"type": "macvlan"/"type": "epair"/' /usr/local/etc/cni/net.d/<name>.conflist
+tee /usr/local/etc/cni/net.d/vlan4.conflist >/dev/null <<'EOF'
+{
+  "cniVersion": "0.4.0",
+  "name": "vlan4",
+  "plugins": [
+    {
+      "type": "epair",
+      "master": "vlan4bridge",
+      "ipam": {
+        "type": "host-local",
+        "routes": [{"dst": "0.0.0.0/0"}],
+        "ranges": [[{"subnet": "192.168.4.0/24", "gateway": "192.168.4.1"}]]
+      },
+      "capabilities": {"ips": true}
+    }
+  ]
+}
+EOF
 ```
 
-`podman network ls` then reports `driver: epair`, which is the truth.
+Change `name`, `master` and `subnet`/`gateway`; the filename matches `name`.
+`master` is the **host bridge**, not the physical NIC. `podman network ls` then
+reports the network with driver `epair`.
 
-**Do not install it as `macvlan`.** That was the original arrangement and it is
-a trap. `containernetworking-plugins` ships no `macvlan` plugin on FreeBSD, so
-squatting that name buys nothing, and the file ends up owned by no package at
-all: `pkg` cannot verify it, will not reinstall it, and nothing restores it if a
-host rebuild or a stray cleanup removes it. It also makes `podman network ls`
-lie about what is doing the work. Under its own name the file is still
-unpackaged, but at least it is honestly named and nothing else claims it.
+Copy-ready configs are in `examples/`:
 
-The per-network `sed` is the cost of this approach. It is easy to forget, so it
-belongs in whatever provisions the network rather than in someone's memory.
+| file | shows |
+|---|---|
+| `vlan.conflist` | the above -- a bridge, a subnet, a gateway |
+| `lan.conflist` | an explicit MTU, a restricted address range, MAC assignment |
+
+`rangeStart`/`rangeEnd` confine automatic allocation to part of the subnet,
+which is what you want when the rest of the segment is handed out by a DHCP
+server or used by static addresses.
+
+**Do not use `podman network create`.** It validates `--driver` against its own
+list -- bridge, macvlan, ipvlan -- and refuses anything else, so it cannot
+create an epair network. Going through it means creating the network under a
+driver name that is not what runs, then rewriting the file afterwards: an extra
+step that, when forgotten, silently routes the network to whatever binary is
+installed as `macvlan`.
 
 ## What it does
 
@@ -52,10 +70,12 @@ Config keys, from the plugin's own header:
 
 | key | required | meaning |
 |---|---|---|
-| `bridge` | yes | host bridge to attach the epair to |
+| `master` | yes | host bridge to attach the epair to (`bridge` is accepted too) |
 | `mtu` | no | interface MTU, default 1500 |
 
-IPAM must supply `ips[].address` and `ips[].gateway`. Capabilities: `mac`, `ips`.
+IPAM must supply `ips[].address` and `ips[].gateway`. Capabilities: `ips` lets
+a container ask for a fixed address (compose's `ipv4_address`), `mac` for a
+fixed MAC.
 
 ## Runtime state
 
@@ -73,7 +93,13 @@ and `CNI_EPAIR_LOG`, which is what makes the plugin testable off a real host.
 ## Install
 
 ```sh
-install -m 755 epair /usr/local/libexec/cni/epair
+pkg install cni-epair
+```
+
+Or by hand:
+
+```sh
+install -m 555 epair /usr/local/libexec/cni/epair
 ```
 
 Verify what is installed:
@@ -83,24 +109,10 @@ head -3 /usr/local/libexec/cni/epair   # should be a shell script, not ELF
 podman network ls                      # networks using it report driver: epair
 ```
 
-## Where it runs
-
-Installed on **jupiter**, the only host with bridged container networks. saturn
-has no copy; venus is Linux and uses the upstream plugins.
-
-| network | bridge | subnet |
-|---|---|---|
-| `vlan5` | `vlan5bridge` | 192.168.5.0/24 |
-| `lan86` | `bridge86` | 192.168.86.0/24 |
-
-Both conflists name `epair`. A second copy of this script remains installed as
-`macvlan`; nothing references it any more and it can be removed once both
-networks have been through a container restart on the new name.
-
 ## Fixes
 
-The plugin ran in production for nine months before these were found. Both are
-worth knowing about if you are reading the code or porting the idea.
+Both are worth knowing about if you are reading the code or porting the idea.
+Fixed in 1.0.0.
 
 **A failed ADD reported success.** None of the commands that build the network
 checked their exit status, and each discarded stderr. If the epair could not be
@@ -126,6 +138,9 @@ path returns a valid result and exit 0.
 
 ## Known limitations
 
+- State is keyed by container id alone, so a container attached to two epair
+  networks records only one of them. Tearing such a container down removes the
+  wrong interface and leaks the other.
 - When a static IP arrives via `CNI_ARGS` rather than IPAM, the gateway is
   guessed as `.1` of that subnet and a missing prefix is assumed to be `/24`.
 - `get_jail_id` falls back to progressively looser matches against `jls` output,

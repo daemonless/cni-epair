@@ -1,0 +1,16 @@
+{
+  "cniVersion": "0.4.0",
+  "name": "vlan4",
+  "plugins": [
+    {
+      "type": "epair",
+      "master": "vlan4bridge",
+      "ipam": {
+        "type": "host-local",
+        "routes": [{"dst": "0.0.0.0/0"}],
+        "ranges": [[{"subnet": "192.168.4.0/24", "gateway": "192.168.4.1"}]]
+      },
+      "capabilities": {"ips": true}
+    }
+  ]
+}
