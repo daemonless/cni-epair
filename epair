@@ -119,6 +119,79 @@ del_epair() {
     rm -f "$state_dir/$container_id" 2>/dev/null
 }
 
+mask2prefix() {
+    local m="$1" bits=0 o
+    for o in $(echo "$m" | tr '.' ' '); do
+        while [ "$o" -gt 0 ]; do
+            bits=$((bits + (o & 1)))
+            o=$((o >> 1))
+        done
+    done
+    echo "$bits"
+}
+
+# dhcp_lease <interface> -- ask the LAN's DHCP server for an address on an
+# interface that is still on the HOST side of the epair.
+#
+# It has to happen here rather than inside the jail: DHCP needs BPF to
+# broadcast, and a container has neither /dev/bpf nor a dhclient binary. The
+# host has both, and the request carries the b-side's MAC, so a reservation
+# keyed on that MAC resolves exactly as it would for a physical host.
+#
+# dhclient is caged with its own config and a script that records the lease and
+# configures nothing: the stock /sbin/dhclient-script would rewrite the HOST's
+# resolv.conf and default route.
+#
+# Prints "<address>/<prefix> <gateway> <dns>"; empty on failure.
+dhcp_lease() {
+    local iface="$1"
+    local dir="${CNI_EPAIR_RUN:-/var/run}/cni-epair-dhcp.$$"
+    local wait_max="${CNI_EPAIR_DHCP_TIMEOUT:-20}"
+    mkdir -p "$dir" || return 1
+
+    # The output path is baked into the script rather than passed in the
+    # environment: dhclient builds the script's environment itself and does not
+    # pass ours through, so an exported variable never arrives.
+    printf '#!/bin/sh\nLEASE_OUT=%s\n' "$dir/result" > "$dir/script"
+    cat >> "$dir/script" <<'EOS'
+case "$reason" in
+BOUND|RENEW|REBIND|REBOOT)
+    printf '%s %s %s %s\n' "$new_ip_address" "$new_subnet_mask" \
+        "$new_routers" "$new_domain_name_servers" > "$LEASE_OUT"
+    ;;
+esac
+exit 0
+EOS
+    chmod 0755 "$dir/script"
+    echo "interface \"$iface\" { script \"$dir/script\"; }" > "$dir/conf"
+
+    dhclient -d -c "$dir/conf" -l "$dir/lease" -p "$dir/pid" "$iface" \
+        >>"$LOG_FILE" 2>&1 &
+    local dhpid=$!
+
+    local waited=0
+    while [ ! -s "$dir/result" ] && [ "$waited" -lt "$wait_max" ]; do
+        kill -0 "$dhpid" 2>/dev/null || break
+        sleep 1
+        waited=$((waited + 1))
+    done
+    kill "$dhpid" 2>/dev/null || true
+    wait "$dhpid" 2>/dev/null || true
+    if [ -f "$dir/pid" ]; then
+        kill "$(cat "$dir/pid" 2>/dev/null)" 2>/dev/null || true
+    fi
+
+    local out=""
+    if [ -s "$dir/result" ]; then
+        local addr mask routers dns
+        read -r addr mask routers dns < "$dir/result"
+        [ -n "$mask" ] || mask=255.255.255.0
+        out="$addr/$(mask2prefix "$mask") ${routers%% *} ${dns%% *}"
+    fi
+    rm -rf "$dir"
+    echo "$out"
+}
+
 cmd_add() {
     local config="$1"
 
@@ -135,6 +208,8 @@ cmd_add() {
     local ip=""
     local gateway=""
     local mac=""
+    local dns=""
+    local use_dhcp=""
 
     if [ -n "$CNI_ARGS" ]; then
         ip=$(echo "$CNI_ARGS" | tr ';' '\n' | grep '^IP=' | cut -d= -f2)
@@ -159,7 +234,11 @@ cmd_add() {
         local ipam_type=$(echo "$config" | awk -F'"ipam":' '{print $2}' | awk -F'"type":"' '{print $2}' | awk -F'"' '{print $1}')
         log "ADD: ipam_type=$ipam_type"
 
-        if [ -n "$ipam_type" ] && [ "$ipam_type" != "none" ] && [ "$ipam_type" != "static" ]; then
+        if [ "$ipam_type" = "dhcp" ]; then
+            # Handled below, once the epair exists and carries its MAC: there
+            # is no /usr/local/libexec/cni/dhcp on FreeBSD to exec.
+            use_dhcp=yes
+        elif [ -n "$ipam_type" ] && [ "$ipam_type" != "none" ] && [ "$ipam_type" != "static" ]; then
             local ipam_result=$(echo "$config" | CNI_COMMAND=ADD /usr/local/libexec/cni/"$ipam_type" 2>/dev/null)
             log "ADD: ipam_result=$ipam_result"
             ip=$(echo "$ipam_result" | grep -o '"address"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | sed 's/.*"\([^"]*\)"$/\1/')
@@ -172,7 +251,7 @@ cmd_add() {
 
     # Validate
     [ -z "$bridge" ] && die "bridge not specified in config"
-    [ -z "$ip" ] && die "IP address not provided by IPAM"
+    [ -z "$ip" ] && [ -z "$use_dhcp" ] && die "IP address not provided by IPAM"
 
     # Check bridge exists
     if ! ifconfig "$bridge" >/dev/null 2>&1; then
@@ -214,6 +293,26 @@ cmd_add() {
     ifconfig "$epair_a" up 2>/dev/null ||
         fail_add "could not bring up $epair_a"
 
+    # The MAC has to be in place BEFORE any DHCP request, so a reservation
+    # keyed on it resolves; it survives the move into the jail.
+    if [ -n "$mac" ]; then
+        ifconfig "$epair_b" ether "$mac" 2>/dev/null ||
+            fail_add "could not set MAC $mac on $epair_b"
+    fi
+
+    # DHCP runs here, on the host side: a jail has no /dev/bpf to broadcast
+    # from and no dhclient to run.
+    if [ -n "$use_dhcp" ]; then
+        ifconfig "$epair_b" up 2>/dev/null ||
+            fail_add "could not bring up $epair_b for DHCP"
+        local lease=$(dhcp_lease "$epair_b")
+        log "ADD: dhcp lease=$lease"
+        [ -z "$lease" ] && fail_add "no DHCP response on $bridge for $epair_b"
+        ip=$(echo "$lease" | awk '{print $1}')
+        gateway=$(echo "$lease" | awk '{print $2}')
+        dns=$(echo "$lease" | awk '{print $3}')
+    fi
+
     # Move to jail
     ifconfig "$epair_b" vnet "$jail_id" >/dev/null 2>&1 ||
         fail_add "could not move $epair_b into jail $jail_id"
@@ -223,10 +322,9 @@ cmd_add() {
     jexec "$jail_id" ifconfig "$epair_b" name "$ifname" >/dev/null 2>&1 ||
         fail_add "could not rename $epair_b to $ifname in jail $jail_id"
 
-    # Set MAC if provided
+    # MAC was applied host-side before the move (see above).
     local actual_mac
     if [ -n "$mac" ]; then
-        jexec "$jail_id" ifconfig "$ifname" ether "$mac" >/dev/null 2>&1
         actual_mac="$mac"
     else
         actual_mac=$(jexec "$jail_id" ifconfig "$ifname" 2>/dev/null | grep ether | awk '{print $2}')
