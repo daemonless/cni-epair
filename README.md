@@ -43,6 +43,13 @@ Copy-ready configs are in `examples/`:
 |---|---|
 | `vlan.conflist` | the above -- a bridge, a subnet, a gateway |
 | `lan.conflist` | an explicit MTU, a restricted address range, MAC assignment |
+| `dual-stack.conflist` | IPv4 and IPv6 together: one range list per family, and a default route for each |
+| `ipv6-only.conflist` | IPv6 with no IPv4 at all |
+
+A second family is a second entry in `ranges` and a second entry in `routes`.
+Both are needed: the range gives the container an address, the route gives it
+somewhere to send. `ranges` with no matching `::/0` leaves a container holding
+a v6 address it cannot leave the segment with.
 
 `rangeStart`/`rangeEnd` confine automatic allocation to part of the subnet,
 which is what you want when the rest of the segment is handed out by a DHCP
@@ -74,8 +81,16 @@ Config keys, from the plugin's own header:
 | `mtu` | no | interface MTU, default 1500 |
 
 IPAM must supply `ips[].address` and `ips[].gateway`. Capabilities: `ips` lets
-a container ask for a fixed address (compose's `ipv4_address`), `mac` for a
-fixed MAC.
+a container ask for a fixed address (compose's `ipv4_address` /
+`ipv6_address`), `mac` for a fixed MAC.
+
+IPv4 and IPv6 are both configured. Every `ips[]` entry is applied, one per
+family, so a conflist with a v4 range and a v6 range gives the container both
+addresses and both default routes; either family alone is enough. Addresses
+are told apart by looking for a colon, not by configuration. On the v6 side
+the interface has `-ifdisabled` cleared first, since FreeBSD leaves IPv6 off
+on an interface until something asks for it and would otherwise refuse the
+address silently.
 
 ## Runtime state
 

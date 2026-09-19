@@ -47,6 +47,13 @@ read_config() {
     cat
 }
 
+# An address is v6 if it contains a colon. Everything below branches on this
+# rather than on configuration: a conflist can carry both families at once and
+# the plugin should not need telling which is which.
+is_v6() {
+    case "$1" in *:*) return 0 ;; *) return 1 ;; esac
+}
+
 # Extract JSON value using simple parsing (no jq dependency)
 json_get() {
     echo "$1" | sed -n "s/.*\"$2\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" | head -1
@@ -206,31 +213,44 @@ cmd_add() {
 
     # Check for static IP and MAC in CNI_ARGS first (from podman --ip and --mac-address flags)
     local ip=""
+    local ip6=""
     local gateway=""
+    local gateway6=""
     local mac=""
     local dns=""
     local use_dhcp=""
 
     if [ -n "$CNI_ARGS" ]; then
-        ip=$(echo "$CNI_ARGS" | tr ';' '\n' | grep '^IP=' | cut -d= -f2)
         mac=$(echo "$CNI_ARGS" | tr ';' '\n' | grep '^MAC=' | cut -d= -f2)
-        if [ -n "$ip" ]; then
-            # Add /24 prefix if not present
-            case "$ip" in
-                */*) ;; # Already has prefix
-                *) ip="$ip/24" ;;
-            esac
-            # Extract gateway from subnet (assume .1)
-            gateway=$(echo "$ip" | sed 's|\.[0-9]*/.*|.1|')
-            log "ADD: Using IP from CNI_ARGS: $ip gateway=$gateway"
-        fi
+        # One entry at a time, and both spellings. podman sends IP= for either
+        # family; other runtimes use IP6= for v6. Collecting them into one
+        # variable first would join two addresses with a newline, and a string
+        # holding a v4 and a v6 tests as v6 -- which then reached ifconfig as a
+        # single malformed argument and failed the whole add.
+        local _arg
+        for _arg in $(echo "$CNI_ARGS" | tr ';' '\n' | grep -E '^IP6?=' | cut -d= -f2-); do
+            if is_v6 "$_arg"; then
+                # No gateway is inferred: ::1 of a prefix means nothing, and
+                # the router is whatever the segment says.
+                case "$_arg" in */*) ip6="$_arg" ;; *) ip6="$_arg/64" ;; esac
+                log "ADD: Using IPv6 from CNI_ARGS: $ip6"
+            else
+                case "$_arg" in */*) ip="$_arg" ;; *) ip="$_arg/24" ;; esac
+                # Extract gateway from subnet (assume .1)
+                gateway=$(echo "$ip" | sed 's|\.[0-9]*/.*|.1|')
+                log "ADD: Using IP from CNI_ARGS: $ip gateway=$gateway"
+            fi
+        done
         if [ -n "$mac" ]; then
             log "ADD: Using MAC from CNI_ARGS: $mac"
         fi
     fi
 
-    # If no IP from args, try IPAM
-    if [ -z "$ip" ]; then
+    # Ask IPAM for whichever family the args did not supply. Gating this on
+    # "$ip" alone meant a static IPv4 on a dual-stack network suppressed IPv6
+    # entirely, while a static IPv6 still got a v4 from IPAM -- the same
+    # request answered two different ways depending on which family you pinned.
+    if [ -z "$ip" ] || [ -z "$ip6" ]; then
         local ipam_type=$(echo "$config" | awk -F'"ipam":' '{print $2}' | awk -F'"type":"' '{print $2}' | awk -F'"' '{print $1}')
         log "ADD: ipam_type=$ipam_type"
 
@@ -241,8 +261,26 @@ cmd_add() {
         elif [ -n "$ipam_type" ] && [ "$ipam_type" != "none" ] && [ "$ipam_type" != "static" ]; then
             local ipam_result=$(echo "$config" | CNI_COMMAND=ADD /usr/local/libexec/cni/"$ipam_type" 2>/dev/null)
             log "ADD: ipam_result=$ipam_result"
-            ip=$(echo "$ipam_result" | grep -o '"address"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | sed 's/.*"\([^"]*\)"$/\1/')
-            gateway=$(echo "$ipam_result" | grep -o '"gateway"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | sed 's/.*"\([^"]*\)"$/\1/')
+            # Every address, not just the first: host-local answers a
+            # dual-stack conflist with one entry per family, and taking the
+            # head of the list silently threw the second one away.
+            local _a _g
+            for _a in $(echo "$ipam_result" | grep -o '"address"[[:space:]]*:[[:space:]]*"[^"]*"' | sed 's/.*"\([^"]*\)"$/\1/'); do
+                if is_v6 "$_a"; then
+                    [ -z "$ip6" ] && ip6="$_a"
+                else
+                    [ -z "$ip" ] && ip="$_a"
+                fi
+            done
+            # Gateways are matched by family rather than by position: a v4
+            # gateway belongs to the v4 subnet whichever order they arrive in.
+            for _g in $(echo "$ipam_result" | grep -o '"gateway"[[:space:]]*:[[:space:]]*"[^"]*"' | sed 's/.*"\([^"]*\)"$/\1/'); do
+                if is_v6 "$_g"; then
+                    [ -z "$gateway6" ] && gateway6="$_g"
+                else
+                    [ -z "$gateway" ] && gateway="$_g"
+                fi
+            done
         fi
     fi
 
@@ -251,7 +289,7 @@ cmd_add() {
 
     # Validate
     [ -z "$bridge" ] && die "bridge not specified in config"
-    [ -z "$ip" ] && [ -z "$use_dhcp" ] && die "IP address not provided by IPAM"
+    [ -z "$ip" ] && [ -z "$ip6" ] && [ -z "$use_dhcp" ] && die "IP address not provided by IPAM"
 
     # Check bridge exists
     if ! ifconfig "$bridge" >/dev/null 2>&1; then
@@ -331,23 +369,40 @@ cmd_add() {
     fi
 
     # Configure IP -- the one step whose failure makes the whole result a lie.
-    jexec "$jail_id" ifconfig "$ifname" inet "$ip" >/dev/null 2>&1 ||
-        fail_add "could not set $ip on $ifname in jail $jail_id"
+    if [ -n "$ip" ]; then
+        jexec "$jail_id" ifconfig "$ifname" inet "$ip" >/dev/null 2>&1 ||
+            fail_add "could not set $ip on $ifname in jail $jail_id"
+    fi
+    if [ -n "$ip6" ]; then
+        # -ifdisabled first: FreeBSD leaves IPv6 off on an interface until
+        # something asks for it, and the address is silently refused otherwise.
+        jexec "$jail_id" ifconfig "$ifname" inet6 -ifdisabled >/dev/null 2>&1 || true
+        jexec "$jail_id" ifconfig "$ifname" inet6 "$ip6" >/dev/null 2>&1 ||
+            fail_add "could not set $ip6 on $ifname in jail $jail_id"
+    fi
 
     # Add gateway route
     if [ -n "$gateway" ]; then
         jexec "$jail_id" route add default "$gateway" >/dev/null 2>&1 || true
     fi
+    if [ -n "$gateway6" ]; then
+        # A link-local gateway is ambiguous without the interface it is on:
+        # `route add -inet6 default fe80::1` fails, fe80::1%eth0 works. Routers
+        # commonly advertise exactly this.
+        case "$gateway6" in
+            fe80:*|FE80:*) [ "${gateway6#*%}" = "$gateway6" ] && gateway6="$gateway6%$ifname" ;;
+        esac
+        jexec "$jail_id" route add -inet6 default "$gateway6" >/dev/null 2>&1 || true
+    fi
 
     # Configure loopback
     jexec "$jail_id" ifconfig lo0 inet 127.0.0.1/8 >/dev/null 2>&1 || true
+    jexec "$jail_id" ifconfig lo0 inet6 ::1/128 >/dev/null 2>&1 || true
 
     # Get host-side MAC before we output results
     local host_mac=$(ifconfig "$epair_a" 2>/dev/null | grep ether | awk '{print $2}')
-    local ip_addr=$(echo "$ip" | cut -d/ -f1)
-    local ip_prefix=$(echo "$ip" | cut -d/ -f2)
 
-    log "ADD: success - $ifname=$ip via $bridge host_mac=$host_mac actual_mac=$actual_mac"
+    log "ADD: success - $ifname=${ip:-none}/${ip6:-none} via $bridge host_mac=$host_mac actual_mac=$actual_mac"
 
     # Output CNI result directly to stdout
     cat <<EOF
@@ -363,13 +418,17 @@ cmd_add() {
       "mac": "$actual_mac"
     }
   ],
-  "ips": [
-    {
-      "address": "$ip",
-      "gateway": "$gateway",
-      "interface": 1
-    }
-  ]
+  "ips": [$(
+    sep=""
+    if [ -n "$ip" ]; then
+        printf '%s\n    {"address": "%s", "gateway": "%s", "interface": 1}' "$sep" "$ip" "$gateway"
+        sep=","
+    fi
+    if [ -n "$ip6" ]; then
+        printf '%s\n    {"address": "%s", "gateway": "%s", "interface": 1}' "$sep" "$ip6" "$gateway6"
+    fi
+    printf '\n  '
+)]
 }
 EOF
     log "ADD: completed output"
@@ -391,6 +450,26 @@ cmd_del() {
     fi
 
     del_epair "$CNI_CONTAINERID"
+
+    # Hand the addresses back. ADD delegates allocation to the IPAM plugin, and
+    # DEL never told it the container was gone -- so host-local kept every
+    # reservation on disk forever and the pool drained one container at a time.
+    # Both families leak together, since each is a separate reservation.
+    #
+    # Best effort: a failure here must not stop the runtime tearing a container
+    # down, and an address that outlives its container is recoverable while a
+    # container that cannot be removed is not.
+    local ipam_type=$(echo "$config" | awk -F'"ipam":' '{print $2}' | awk -F'"type":"' '{print $2}' | awk -F'"' '{print $1}')
+    case "$ipam_type" in
+        ""|none|static|dhcp) ;; # nothing was allocated by a plugin
+        *)
+            if [ -x /usr/local/libexec/cni/"$ipam_type" ]; then
+                echo "$config" | CNI_COMMAND=DEL /usr/local/libexec/cni/"$ipam_type" >/dev/null 2>&1 ||
+                    log "DEL: ipam $ipam_type returned an error, addresses may stay reserved"
+                log "DEL: released addresses via $ipam_type"
+            fi
+            ;;
+    esac
 
     # Success (even if nothing to clean up)
     cat <<EOF

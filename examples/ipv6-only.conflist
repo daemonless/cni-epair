@@ -1,0 +1,16 @@
+{
+  "cniVersion": "0.4.0",
+  "name": "lan6only",
+  "plugins": [
+    {
+      "type": "epair",
+      "master": "lanbridge",
+      "ipam": {
+        "type": "host-local",
+        "routes": [{"dst": "::/0"}],
+        "ranges": [[{"subnet": "fd00:4:103:9::/64", "gateway": "fd00:4:103:9::1"}]]
+      },
+      "capabilities": {"ips": true, "mac": true}
+    }
+  ]
+}
