@@ -255,9 +255,12 @@ cmd_add() {
         log "ADD: ipam_type=$ipam_type"
 
         if [ "$ipam_type" = "dhcp" ]; then
+            # Only when no IPv4 came in: DHCP is IPv4-only here, and the
+            # lease below overwrites $ip, losing a pinned address.
+            #
             # Handled below, once the epair exists and carries its MAC: there
             # is no /usr/local/libexec/cni/dhcp on FreeBSD to exec.
-            use_dhcp=yes
+            [ -z "$ip" ] && use_dhcp=yes
         elif [ -n "$ipam_type" ] && [ "$ipam_type" != "none" ] && [ "$ipam_type" != "static" ]; then
             local ipam_result=$(echo "$config" | CNI_COMMAND=ADD /usr/local/libexec/cni/"$ipam_type" 2>/dev/null)
             log "ADD: ipam_result=$ipam_result"
