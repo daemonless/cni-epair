@@ -24,8 +24,6 @@ LOG_FILE="${CNI_EPAIR_LOG:-/var/log/cni-freebsd-epair.log}"
 # Redirect all stderr to log file to avoid polluting podman's parsing
 exec 2>>"$LOG_FILE"
 
-LOCK_FILE="${CNI_EPAIR_LOCK:-/var/run/cni-freebsd-epair.lock}"
-
 log() {
     echo "$(date '+%Y-%m-%d %H:%M:%S') [$$] $*" >> "$LOG_FILE" 2>/dev/null || :
 }
@@ -81,28 +79,6 @@ get_jail_id() {
         jid=$(jls | grep "$short_id" | awk '{print $1}' | head -1)
     fi
     echo "$jid"
-}
-
-# Acquire lock for epair creation (avoid race conditions)
-lock() {
-    local i=0
-    while [ $i -lt 10 ]; do
-        if mkdir "$LOCK_FILE" 2>/dev/null; then
-            trap 'rmdir "$LOCK_FILE" 2>/dev/null' EXIT
-            return 0
-        fi
-        sleep 0.1
-        i=$((i + 1))
-    done
-    die "Failed to acquire lock"
-}
-
-unlock() {
-    # Clear the EXIT trap first. Without this it fires again at exit and
-    # removes whatever lock directory exists by then -- which, under
-    # concurrency, is the one another invocation has just acquired.
-    trap - EXIT
-    rmdir "$LOCK_FILE" 2>/dev/null || true
 }
 
 # Track epair for cleanup
@@ -304,10 +280,9 @@ cmd_add() {
     [ -z "$jail_id" ] && die "Could not find jail for container $CNI_CONTAINERID"
     log "ADD: jail_id=$jail_id"
 
-    # Create epair (with lock to avoid race)
-    lock
-    local epair_a=$(ifconfig epair create)
-    unlock
+    # No lock: the kernel hands out the unit, so parallel creates never collide.
+    local epair_a
+    epair_a=$(ifconfig epair create) || die "could not create an epair"
 
     local epair_b=$(echo "$epair_a" | sed 's/a$/b/')
     log "ADD: created $epair_a / $epair_b"

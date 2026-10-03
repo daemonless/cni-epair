@@ -97,12 +97,11 @@ address silently.
 | path | purpose |
 |---|---|
 | `/var/run/cni/freebsd-epair` | container id → epair name, so `DEL` can find it |
-| `/var/run/cni-freebsd-epair.lock` | serialises concurrent ADD/DEL |
 | `/var/log/cni-freebsd-epair.log` | all logging; stderr is redirected here so it cannot corrupt the JSON podman parses |
 
 These keep their original `freebsd-epair` spelling even though the plugin is
 now named `epair`: renaming them would orphan the state of every container
-already running. Each can be overridden with `CNI_EPAIR_STATE`, `CNI_EPAIR_LOCK`
+already running. Each can be overridden with `CNI_EPAIR_STATE`
 and `CNI_EPAIR_LOG`, which is what makes the plugin testable off a real host.
 
 ## Install
@@ -141,11 +140,12 @@ Every step that builds the network is now checked. A failure returns a CNI error
 naming the step, and destroys the epair it had already created rather than
 leaking it onto the bridge.
 
-**The lock could be released by the wrong process.** `lock()` installed an `EXIT`
-trap to clean up, which `unlock()` never cleared. The trap fired again at process
-exit and removed whatever lock directory existed by then — under concurrency,
-the one another invocation had just acquired. `unlock()` now clears the trap
-first.
+**The lock is gone.** It was a directory made with `mkdir` around
+`ifconfig epair create`. A plugin killed while holding it left the directory
+behind, and every later `ADD` failed with "Failed to acquire lock" until someone
+removed it. It guarded nothing: the kernel hands out the epair unit itself and
+the plugin uses the name it returns, so parallel creates never collide. (A lock
+earns its keep around a shared bridge, which this plugin never creates.)
 
 Both paths are exercised with stubbed `ifconfig`, `jexec` and `jls`: a forced
 failure returns a CNI error and exit 1 with the epair cleaned up; the success
