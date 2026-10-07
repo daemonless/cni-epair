@@ -113,6 +113,17 @@ mask2prefix() {
     echo "$bits"
 }
 
+# dhcp_hostname -- the container's name (podman passes K8S_POD_NAME) as a
+# valid hostname. dhclient runs on the host, so without one it sends the
+# HOST's name and the router points that name at the container.
+dhcp_hostname() {
+    local name
+    name=$(echo "$CNI_ARGS" | tr ';' '\n' | sed -n 's/^K8S_POD_NAME=//p' | head -1)
+    [ -n "$name" ] || name="c-$(echo "$CNI_CONTAINERID" | cut -c1-12)"
+    name=$(echo "$name" | tr 'A-Z_.' 'a-z--' | tr -cd 'a-z0-9-' | cut -c1-63 | sed 's/^-*//; s/-*$//')
+    echo "${name:-container}"
+}
+
 # dhcp_lease <interface> -- ask the LAN's DHCP server for an address on an
 # interface that is still on the HOST side of the epair.
 #
@@ -146,7 +157,7 @@ esac
 exit 0
 EOS
     chmod 0755 "$dir/script"
-    echo "interface \"$iface\" { script \"$dir/script\"; }" > "$dir/conf"
+    echo "interface \"$iface\" { send host-name \"$(dhcp_hostname)\"; script \"$dir/script\"; }" > "$dir/conf"
 
     dhclient -d -c "$dir/conf" -l "$dir/lease" -p "$dir/pid" "$iface" \
         >>"$LOG_FILE" 2>&1 &
