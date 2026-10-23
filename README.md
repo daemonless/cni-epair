@@ -45,6 +45,7 @@ Copy-ready configs are in `examples/`:
 | `lan.conflist` | an explicit MTU, a restricted address range, MAC assignment |
 | `dual-stack.conflist` | IPv4 and IPv6 together: one range list per family, and a default route for each |
 | `ipv6-only.conflist` | IPv6 with no IPv4 at all |
+| `vlanfilter.conflist` | one VLAN of a trunk on a `vlanfilter` bridge (`vlan`, `taggedVlans`) |
 
 A second family is a second entry in `ranges` and a second entry in `routes`.
 Both are needed: the range gives the container an address, the route gives it
@@ -79,6 +80,62 @@ Config keys, from the plugin's own header:
 |---|---|---|
 | `master` | yes | host bridge to attach the epair to (`bridge` is accepted too) |
 | `mtu` | no | interface MTU, default 1500 |
+| `vlan` | no | untagged VLAN ID (1-4094) for the epair on a `vlanfilter` bridge |
+| `taggedVlans` | no | VLANs the epair may carry tagged, in `ifconfig`'s list syntax: `"3,4"`, `"10-20"`, `"all"` |
+
+`vlan` and `taggedVlans` become `ifconfig <bridge> addm <epair> untagged <vlan>
+tagged <list>`. They only filter on a bridge with `vlanfilter` set (FreeBSD
+15), so the plugin refuses them on a bridge without it rather than hand the
+container every VLAN. One network is one VLAN: to put containers on VLAN 2 and
+others on VLAN 3, make two networks on the same bridge. The container's
+interface sees the `vlan` traffic untagged; frames for `taggedVlans` arrive
+still tagged, so the container needs its own `vlan` interfaces to use them.
+
+### Example: two VLANs on one trunk
+
+The host's uplink, `igb0` here, is a trunk carrying VLANs 2 and 3 tagged. The
+bridge filters, and the uplink is a member allowed both tags, so frames leave
+for the switch still tagged:
+
+```sh
+sysrc cloned_interfaces+="bridge0"
+sysrc ifconfig_bridge0="vlanfilter addm igb0 tagged 2,3 up"
+sysrc ifconfig_igb0="up"
+service netif restart bridge0
+```
+
+Then one network per VLAN. VLAN 2, as in `examples/vlanfilter.conflist`:
+
+```json
+{
+  "cniVersion": "0.4.0",
+  "name": "vlan2",
+  "plugins": [
+    {
+      "type": "epair",
+      "master": "bridge0",
+      "vlan": 2,
+      "ipam": {
+        "type": "host-local",
+        "routes": [{"dst": "0.0.0.0/0"}],
+        "ranges": [[{"subnet": "192.168.2.0/24", "gateway": "192.168.2.1"}]]
+      },
+      "capabilities": {"ips": true, "mac": true}
+    }
+  ]
+}
+```
+
+VLAN 3 is the same file with `"name": "vlan3"`, `"vlan": 3` and its own
+subnet and gateway. A container joins a VLAN by joining its network:
+
+```sh
+podman run -d --network vlan2 ghcr.io/daemonless/traefik:latest
+podman run -d --network vlan3 ghcr.io/daemonless/redis:latest
+```
+
+Containers on `vlan2` reach each other and VLAN 2 on the switch, and nothing
+on VLAN 3. This setup gives the host itself no address on either VLAN.
 
 IPAM must supply `ips[].address` and `ips[].gateway`. Capabilities: `ips` lets
 a container ask for a fixed address (compose's `ipv4_address` /

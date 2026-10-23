@@ -1,0 +1,17 @@
+{
+  "cniVersion": "0.4.0",
+  "name": "vlan2",
+  "plugins": [
+    {
+      "type": "epair",
+      "master": "bridge0",
+      "vlan": 2,
+      "ipam": {
+        "type": "host-local",
+        "routes": [{"dst": "0.0.0.0/0"}],
+        "ranges": [[{"subnet": "192.168.2.0/24", "gateway": "192.168.2.1"}]]
+      },
+      "capabilities": {"ips": true, "mac": true}
+    }
+  ]
+}

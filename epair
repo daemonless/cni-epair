@@ -8,6 +8,8 @@
 # Config options (in CNI config JSON):
 #   bridge: name of bridge to attach to (required)
 #   mtu: MTU for interface (optional, default: 1500)
+#   vlan: untagged VLAN ID on a vlanfilter bridge (optional, 1-4094)
+#   taggedVlans: VLANs allowed tagged, ifconfig's list syntax (optional, "3,4", "10-20")
 #
 # IPAM must provide:
 #   ips[].address: IP address with prefix (e.g., "192.168.86.8/24")
@@ -55,6 +57,18 @@ is_v6() {
 # Extract JSON value using simple parsing (no jq dependency)
 json_get() {
     echo "$1" | sed -n "s/.*\"$2\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" | head -1
+}
+
+# Like json_get, but also takes a bare number ("vlan": 2 as well as "vlan": "2")
+json_get_scalar() {
+    local v=$(json_get "$1" "$2")
+    [ -n "$v" ] || v=$(echo "$1" | sed -n "s/.*\"$2\"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p" | head -1)
+    echo "$v"
+}
+
+# True if the config has the key at all, whatever its value
+json_has() {
+    echo "$1" | grep -q "\"$2\"[[:space:]]*:"
 }
 
 # Extract nested value like prevResult.interfaces[0].name
@@ -198,6 +212,34 @@ cmd_add() {
     local mtu=$(json_get "$config" "mtu")
     [ -z "$mtu" ] && mtu=1500
 
+    # VLAN membership on a vlanfilter bridge. Checked here, before anything is
+    # created: the values land unquoted on the addm command line.
+    local vlan=$(json_get_scalar "$config" "vlan")
+    local tagged=$(json_get_scalar "$config" "taggedVlans")
+    # A key the parser can't read (an array, say) would otherwise drop silently
+    json_has "$config" "vlan" && [ -z "$vlan" ] &&
+        die "vlan must be a number like 2"
+    json_has "$config" "taggedVlans" && [ -z "$tagged" ] &&
+        die "taggedVlans must be a string like \"3,4\" or \"10-20\""
+    local addm_opts=""
+    if [ -n "$vlan" ]; then
+        case "$vlan" in *[!0-9]*) die "vlan must be a number, got '$vlan'" ;; esac
+        [ "$vlan" -ge 1 ] && [ "$vlan" -le 4094 ] || die "vlan must be 1-4094, got $vlan"
+        addm_opts="untagged $vlan"
+    fi
+    if [ -n "$tagged" ]; then
+        case "$tagged" in
+            all|none) ;;
+            *[!0-9,-]*) die "taggedVlans must be a list like 3,4 or 10-20, got '$tagged'" ;;
+        esac
+        addm_opts="$addm_opts tagged $tagged"
+    fi
+    # Without vlanfilter the bridge accepts the VLAN options and passes every VLAN
+    if [ -n "$addm_opts" ] && ifconfig "$bridge" >/dev/null 2>&1 &&
+        ! ifconfig "$bridge" | grep -q 'bridge flags=.*VLANFILTER'; then
+        die "$bridge has no vlanfilter, so vlan/taggedVlans would not isolate anything; run: ifconfig $bridge vlanfilter"
+    fi
+
     # Check for static IP and MAC in CNI_ARGS first (from podman --ip and --mac-address flags)
     local ip=""
     local ip6=""
@@ -315,8 +357,9 @@ cmd_add() {
     }
 
     # Configure host side
-    ifconfig "$bridge" addm "$epair_a" 2>/dev/null ||
-        fail_add "could not add $epair_a to bridge $bridge"
+    # $addm_opts unquoted on purpose: it is zero or more validated words.
+    ifconfig "$bridge" addm "$epair_a" $addm_opts 2>/dev/null ||
+        fail_add "could not add $epair_a to bridge $bridge${addm_opts:+ with $addm_opts}"
     ifconfig "$epair_a" up 2>/dev/null ||
         fail_add "could not bring up $epair_a"
 
@@ -494,6 +537,7 @@ EOF
 # the VERSION reply: that schema is CNI's, not ours.
 cmd_features() {
     echo "dhcp"
+    echo "vlan"
 }
 
 cmd_version() {
