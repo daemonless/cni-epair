@@ -182,8 +182,8 @@ podman network ls                      # networks using it report driver: epair
 
 ## Fixes
 
-Both are worth knowing about if you are reading the code or porting the idea.
-Fixed in 1.0.0.
+Worth knowing about if you are reading the code or porting the idea. The first
+two were fixed in 1.0.0, the third in 1.2.1.
 
 **A failed ADD reported success.** None of the commands that build the network
 checked their exit status, and each discarded stderr. If the epair could not be
@@ -204,9 +204,17 @@ removed it. It guarded nothing: the kernel hands out the epair unit itself and
 the plugin uses the name it returns, so parallel creates never collide. (A lock
 earns its keep around a shared bridge, which this plugin never creates.)
 
-Both paths are exercised with stubbed `ifconfig`, `jexec` and `jls`: a forced
-failure returns a CNI error and exit 1 with the epair cleaned up; the success
-path returns a valid result and exit 0.
+Both paths are exercised with stubbed `ifconfig` and `jls`: a forced failure
+returns a CNI error and exit 1 with the epair cleaned up; the success path
+returns a valid result and exit 0.
+
+**Nothing runs inside the container.** The jail side used to be configured with
+`jexec <jail> ifconfig ...`, which needs an `ifconfig` in the image. A
+stripped-down FreeBSD image, or a Linux one, has none, and ADD failed at the
+rename of the epair. `ifconfig -j` and `route -j` attach the host's own
+binaries to the jail's vnet instead, which ifconfig(8) documents for exactly
+this case. The image's contents no longer matter to its network. This is also
+why the plugin needs FreeBSD 14.0 or newer: `route -j` is not in 13.
 
 ## Known limitations
 
