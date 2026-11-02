@@ -389,7 +389,7 @@ cmd_add() {
 
     # Configure jail side (redirect output to avoid polluting stdout)
     local ifname="${CNI_IFNAME:-eth0}"
-    jexec "$jail_id" ifconfig "$epair_b" name "$ifname" >/dev/null 2>&1 ||
+    ifconfig -j "$jail_id" "$epair_b" name "$ifname" >/dev/null 2>&1 ||
         fail_add "could not rename $epair_b to $ifname in jail $jail_id"
 
     # MAC was applied host-side before the move (see above).
@@ -397,25 +397,25 @@ cmd_add() {
     if [ -n "$mac" ]; then
         actual_mac="$mac"
     else
-        actual_mac=$(jexec "$jail_id" ifconfig "$ifname" 2>/dev/null | grep ether | awk '{print $2}')
+        actual_mac=$(ifconfig -j "$jail_id" "$ifname" 2>/dev/null | grep ether | awk '{print $2}')
     fi
 
     # Configure IP -- the one step whose failure makes the whole result a lie.
     if [ -n "$ip" ]; then
-        jexec "$jail_id" ifconfig "$ifname" inet "$ip" >/dev/null 2>&1 ||
+        ifconfig -j "$jail_id" "$ifname" inet "$ip" >/dev/null 2>&1 ||
             fail_add "could not set $ip on $ifname in jail $jail_id"
     fi
     if [ -n "$ip6" ]; then
         # -ifdisabled first: FreeBSD leaves IPv6 off on an interface until
         # something asks for it, and the address is silently refused otherwise.
-        jexec "$jail_id" ifconfig "$ifname" inet6 -ifdisabled >/dev/null 2>&1 || true
-        jexec "$jail_id" ifconfig "$ifname" inet6 "$ip6" >/dev/null 2>&1 ||
+        ifconfig -j "$jail_id" "$ifname" inet6 -ifdisabled >/dev/null 2>&1 || true
+        ifconfig -j "$jail_id" "$ifname" inet6 "$ip6" >/dev/null 2>&1 ||
             fail_add "could not set $ip6 on $ifname in jail $jail_id"
     fi
 
     # Add gateway route
     if [ -n "$gateway" ]; then
-        jexec "$jail_id" route add default "$gateway" >/dev/null 2>&1 || true
+        route -j "$jail_id" add default "$gateway" >/dev/null 2>&1 || true
     fi
     if [ -n "$gateway6" ]; then
         # A link-local gateway is ambiguous without the interface it is on:
@@ -424,12 +424,12 @@ cmd_add() {
         case "$gateway6" in
             fe80:*|FE80:*) [ "${gateway6#*%}" = "$gateway6" ] && gateway6="$gateway6%$ifname" ;;
         esac
-        jexec "$jail_id" route add -inet6 default "$gateway6" >/dev/null 2>&1 || true
+        route -j "$jail_id" add -inet6 default "$gateway6" >/dev/null 2>&1 || true
     fi
 
     # Configure loopback
-    jexec "$jail_id" ifconfig lo0 inet 127.0.0.1/8 >/dev/null 2>&1 || true
-    jexec "$jail_id" ifconfig lo0 inet6 ::1/128 >/dev/null 2>&1 || true
+    ifconfig -j "$jail_id" lo0 inet 127.0.0.1/8 >/dev/null 2>&1 || true
+    ifconfig -j "$jail_id" lo0 inet6 ::1/128 >/dev/null 2>&1 || true
 
     # Get host-side MAC before we output results
     local host_mac=$(ifconfig "$epair_a" 2>/dev/null | grep ether | awk '{print $2}')
@@ -521,7 +521,7 @@ cmd_check() {
         die "Container not running"
     fi
 
-    if ! jexec "$jail_id" ifconfig "$ifname" >/dev/null 2>&1; then
+    if ! ifconfig -j "$jail_id" "$ifname" >/dev/null 2>&1; then
         die "Interface $ifname not found in jail"
     fi
 
