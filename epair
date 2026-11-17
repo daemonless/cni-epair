@@ -7,7 +7,7 @@
 #
 # Config options (in CNI config JSON):
 #   bridge: name of bridge to attach to (required)
-#   mtu: MTU for interface (optional, default: 1500)
+#   mtu: MTU for both ends of the epair (optional, 576-65535; default: 1500)
 #   vlan: untagged VLAN ID on a vlanfilter bridge (optional, 1-4094)
 #   taggedVlans: VLANs allowed tagged, ifconfig's list syntax (optional, "3,4", "10-20")
 #
@@ -32,14 +32,26 @@ log() {
 
 die() {
     log "ERROR: $1"
-    cat <<EOF
-{
-  "cniVersion": "1.0.0",
-  "code": 100,
-  "msg": "$1"
-}
-EOF
+    # Escaped, or a message quoting an example ("3,4") is not JSON and the
+    # runtime reports a parse error instead of the reason.
+    local msg
+    msg=$(printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g')
+    printf '{\n  "cniVersion": "1.0.0",\n  "code": 100,\n  "msg": "%s"\n}\n' "$msg"
     exit 1
+}
+
+# ipam_plugin <type> -- the IPAM binary, from CNI_PATH as the runtime sets it,
+# then the FreeBSD default.
+ipam_plugin() {
+    local dir search="${CNI_PATH:+$CNI_PATH:}/usr/local/libexec/cni"
+    local IFS=:
+    for dir in $search; do
+        if [ -n "$dir" ] && [ -x "$dir/$1" ]; then
+            echo "$dir/$1"
+            return 0
+        fi
+    done
+    return 1
 }
 
 # Read entire stdin
@@ -209,8 +221,15 @@ cmd_add() {
     # Parse config - podman uses "master" for parent interface
     local bridge=$(json_get "$config" "master")
     [ -z "$bridge" ] && bridge=$(json_get "$config" "bridge")
-    local mtu=$(json_get "$config" "mtu")
-    [ -z "$mtu" ] && mtu=1500
+    # Both spellings ("mtu": 9000 and "mtu": "9000"); unset leaves the epair's
+    # own 1500.
+    local mtu=$(json_get_scalar "$config" "mtu")
+    json_has "$config" "mtu" && [ -z "$mtu" ] &&
+        die "mtu must be a number like 9000"
+    if [ -n "$mtu" ]; then
+        case "$mtu" in *[!0-9]*) die "mtu must be a number, got '$mtu'" ;; esac
+        [ "$mtu" -ge 576 ] && [ "$mtu" -le 65535 ] || die "mtu must be 576-65535, got $mtu"
+    fi
 
     # VLAN membership on a vlanfilter bridge. Checked here, before anything is
     # created: the values land unquoted on the addm command line.
@@ -291,7 +310,9 @@ cmd_add() {
             # is no /usr/local/libexec/cni/dhcp on FreeBSD to exec.
             [ -z "$ip" ] && use_dhcp=yes
         elif [ -n "$ipam_type" ] && [ "$ipam_type" != "none" ] && [ "$ipam_type" != "static" ]; then
-            local ipam_result=$(echo "$config" | CNI_COMMAND=ADD /usr/local/libexec/cni/"$ipam_type" 2>/dev/null)
+            local ipam_bin
+            ipam_bin=$(ipam_plugin "$ipam_type") || die "IPAM plugin $ipam_type not found"
+            local ipam_result=$(echo "$config" | CNI_COMMAND=ADD "$ipam_bin" 2>/dev/null)
             log "ADD: ipam_result=$ipam_result"
             # Every address, not just the first: host-local answers a
             # dual-stack conflist with one entry per family, and taking the
@@ -355,6 +376,14 @@ cmd_add() {
         del_epair "$CNI_CONTAINERID"
         die "$1"
     }
+
+    # Both ends, before the bridge sees the member and before the move.
+    if [ -n "$mtu" ]; then
+        ifconfig "$epair_a" mtu "$mtu" 2>/dev/null ||
+            fail_add "could not set MTU $mtu on $epair_a"
+        ifconfig "$epair_b" mtu "$mtu" 2>/dev/null ||
+            fail_add "could not set MTU $mtu on $epair_b"
+    fi
 
     # Configure host side
     # $addm_opts unquoted on purpose: it is zero or more validated words.
@@ -460,7 +489,11 @@ cmd_add() {
         printf '%s\n    {"address": "%s", "gateway": "%s", "interface": 1}' "$sep" "$ip6" "$gateway6"
     fi
     printf '\n  '
-)]
+)]$(
+    # The lease's DNS server, the one thing a DHCP network knows that the
+    # runtime does not.
+    [ -n "$dns" ] && printf ',\n  "dns": {"nameservers": ["%s"]}' "$dns"
+)
 }
 EOF
     log "ADD: completed output"
@@ -495,8 +528,9 @@ cmd_del() {
     case "$ipam_type" in
         ""|none|static|dhcp) ;; # nothing was allocated by a plugin
         *)
-            if [ -x /usr/local/libexec/cni/"$ipam_type" ]; then
-                echo "$config" | CNI_COMMAND=DEL /usr/local/libexec/cni/"$ipam_type" >/dev/null 2>&1 ||
+            local ipam_bin
+            if ipam_bin=$(ipam_plugin "$ipam_type"); then
+                echo "$config" | CNI_COMMAND=DEL "$ipam_bin" >/dev/null 2>&1 ||
                     log "DEL: ipam $ipam_type returned an error, addresses may stay reserved"
                 log "DEL: released addresses via $ipam_type"
             fi
