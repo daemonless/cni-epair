@@ -84,7 +84,7 @@ Config keys, from the plugin's own header:
 | key | required | meaning |
 |---|---|---|
 | `master` | yes | host bridge to attach the epair to (`bridge` is accepted too) |
-| `mtu` | no | MTU for both ends of the epair (576-65535), default 1500; match the bridge's |
+| `mtu` | no | MTU for both ends of the epair (576-65535), default the bridge's |
 | `vlan` | no | untagged VLAN ID (1-4094) for the epair on a `vlanfilter` bridge |
 | `taggedVlans` | no | VLANs the epair may carry tagged, in `ifconfig`'s list syntax: `"3,4"`, `"10-20"`, `"all"` |
 
@@ -175,6 +175,17 @@ sh tests/run.sh
 Runs the plugin against stub `ifconfig`, `jls`, `route`, `dhclient` and
 `host-local` and checks every reply with `jq`. Nothing touches the host's
 network. CI runs it on every push.
+
+```sh
+DHCP_BRIDGE=lanbridge sh tests/host.sh   # as root, on a test machine
+```
+
+The same plugin on a real FreeBSD host with podman: MTU on both ends,
+host-local and static addresses, errors as podman shows them, a DHCP lease
+and its DNS server, teardown. It installs the plugin as `epair-test` on a
+bridge of its own (`ept0`), so an installed `epair` and its networks are
+untouched, and removes everything on exit. Without `DHCP_BRIDGE` the DHCP
+check is skipped.
 
 ## Install
 

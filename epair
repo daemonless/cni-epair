@@ -7,7 +7,7 @@
 #
 # Config options (in CNI config JSON):
 #   bridge: name of bridge to attach to (required)
-#   mtu: MTU for both ends of the epair (optional, 576-65535; default: 1500)
+#   mtu: MTU for both ends of the epair (optional, 576-65535; default: the bridge's)
 #   vlan: untagged VLAN ID on a vlanfilter bridge (optional, 1-4094)
 #   taggedVlans: VLANs allowed tagged, ifconfig's list syntax (optional, "3,4", "10-20")
 #
@@ -221,8 +221,8 @@ cmd_add() {
     # Parse config - podman uses "master" for parent interface
     local bridge=$(json_get "$config" "master")
     [ -z "$bridge" ] && bridge=$(json_get "$config" "bridge")
-    # Both spellings ("mtu": 9000 and "mtu": "9000"); unset leaves the epair's
-    # own 1500.
+    # Both spellings ("mtu": 9000 and "mtu": "9000"); unset takes the bridge's
+    # once it is known to exist.
     local mtu=$(json_get_scalar "$config" "mtu")
     json_has "$config" "mtu" && [ -z "$mtu" ] &&
         die "mtu must be a number like 9000"
@@ -347,6 +347,13 @@ cmd_add() {
     # Check bridge exists
     if ! ifconfig "$bridge" >/dev/null 2>&1; then
         die "bridge $bridge does not exist"
+    fi
+
+    # Unset: the bridge's. FreeBSD takes a 1500 member on a 9000 bridge without
+    # a word, and large frames then die at the epair.
+    if [ -z "$mtu" ]; then
+        mtu=$(ifconfig "$bridge" 2>/dev/null | sed -n '1s/.* mtu \([0-9]*\).*/\1/p')
+        [ "$mtu" = 1500 ] && mtu=""
     fi
 
     # Get jail ID

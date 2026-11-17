@@ -21,7 +21,7 @@ fi
 case "$*" in
 "epair create") echo epair0a ;;
 nobridge) exit 1 ;;
-bridge0) printf 'bridge0: flags=8843<UP>\n\tbridge flags=%s\n' "${BRIDGE_FLAGS:-0}" ;;
+bridge0) printf 'bridge0: flags=8843<UP> metric 0 mtu %s\n\tbridge flags=%s\n' "${BRIDGE_MTU:-1500}" "${BRIDGE_FLAGS:-0}" ;;
 epair0a) printf 'epair0a: flags=8843<UP>\n\tether 02:00:00:00:00:0a\n' ;;
 "-j 7 eth0") printf 'eth0: flags=8843<UP>\n\tether 02:00:00:00:00:0b\n' ;;
 esac
@@ -97,7 +97,7 @@ run ADD "$(conf '' static)" CNI_ARGS="IP=10.0.0.5/24"
 check "static: address and guessed gateway" '.ips[0].address == "10.0.0.5/24" and .ips[0].gateway == "10.0.0.1"'
 check "static: no dns without a lease" 'has("dns") | not'
 called "static: address set in the jail" "ifconfig -j 7 eth0 inet 10.0.0.5/24"
-not_called "static: no MTU unless asked" " mtu "
+not_called "static: no MTU set on a 1500 bridge" " mtu "
 [ "$(cat "$T/state/$CNI_CONTAINERID")" = epair0a ] && ok "static: state recorded" || bad "static: state recorded"
 
 # --- MTU, as a number and as a string
@@ -107,6 +107,11 @@ for m in 9000 '"9000"'; do
     called "mtu $m: host end" "ifconfig epair0a mtu 9000"
     called "mtu $m: jail end" "ifconfig epair0b mtu 9000"
 done
+run ADD "$(conf '' static)" CNI_ARGS="IP=10.0.0.5/24" BRIDGE_MTU=9000
+called "no mtu on a 9000 bridge: host end follows it" "ifconfig epair0a mtu 9000"
+called "no mtu on a 9000 bridge: jail end follows it" "ifconfig epair0b mtu 9000"
+run ADD "$(conf ',"mtu":1500' static)" CNI_ARGS="IP=10.0.0.5/24" BRIDGE_MTU=9000
+called "mtu 1500 on a 9000 bridge: the config wins" "ifconfig epair0a mtu 1500"
 run ADD "$(conf ',"mtu":"big"' static)" CNI_ARGS="IP=10.0.0.5/24"
 [ "$rc" -eq 1 ] && ok "mtu big: refused" || bad "mtu big: exit $rc" "$out"
 check "mtu big: error is JSON" '.code == 100 and (.msg | test("mtu"))'
