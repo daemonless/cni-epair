@@ -71,15 +71,20 @@ returned. On `DEL` it tears the epair down again. `CHECK` and `VERSION` are
 implemented, so it satisfies the CNI contract podman expects.
 
 It shells out to the IPAM plugin named in the network config (`host-local` on
-these hosts) rather than allocating addresses itself, and parses JSON with `sed`
+these hosts) rather than allocating addresses itself, found on the runtime's
+`CNI_PATH` and then in `/usr/local/libexec/cni/`. It parses JSON with `sed`
 and `grep` to avoid a `jq` dependency.
+
+With `"ipam": {"type": "dhcp"}` the plugin asks the LAN's DHCP server itself,
+from the host, before the interface moves into the jail. The result carries the
+lease's address, gateway and DNS server.
 
 Config keys, from the plugin's own header:
 
 | key | required | meaning |
 |---|---|---|
 | `master` | yes | host bridge to attach the epair to (`bridge` is accepted too) |
-| `mtu` | no | interface MTU, default 1500 |
+| `mtu` | no | MTU for both ends of the epair (576-65535), default the bridge's |
 | `vlan` | no | untagged VLAN ID (1-4094) for the epair on a `vlanfilter` bridge |
 | `taggedVlans` | no | VLANs the epair may carry tagged, in `ifconfig`'s list syntax: `"3,4"`, `"10-20"`, `"all"` |
 
@@ -161,6 +166,27 @@ now named `epair`: renaming them would orphan the state of every container
 already running. Each can be overridden with `CNI_EPAIR_STATE`
 and `CNI_EPAIR_LOG`, which is what makes the plugin testable off a real host.
 
+## Tests
+
+```sh
+sh tests/run.sh
+```
+
+Runs the plugin against stub `ifconfig`, `jls`, `route`, `dhclient` and
+`host-local` and checks every reply with `jq`. Nothing touches the host's
+network. CI runs it on every push.
+
+```sh
+DHCP_BRIDGE=lanbridge sh tests/host.sh   # as root, on a test machine
+```
+
+The same plugin on a real FreeBSD host with podman: MTU on both ends,
+host-local and static addresses, errors as podman shows them, a DHCP lease
+and its DNS server, teardown. It installs the plugin as `epair-test` on a
+bridge of its own (`ept0`), so an installed `epair` and its networks are
+untouched, and removes everything on exit. Without `DHCP_BRIDGE` the DHCP
+check is skipped.
+
 ## Install
 
 ```sh
@@ -204,9 +230,9 @@ removed it. It guarded nothing: the kernel hands out the epair unit itself and
 the plugin uses the name it returns, so parallel creates never collide. (A lock
 earns its keep around a shared bridge, which this plugin never creates.)
 
-Both paths are exercised with stubbed `ifconfig` and `jls`: a forced failure
-returns a CNI error and exit 1 with the epair cleaned up; the success path
-returns a valid result and exit 0.
+Both paths are covered by `tests/run.sh`: a forced failure returns a CNI error
+and exit 1 with the epair cleaned up; the success path returns a valid result
+and exit 0.
 
 **Nothing runs inside the container.** The jail side used to be configured with
 `jexec <jail> ifconfig ...`, which needs an `ifconfig` in the image. A
@@ -226,6 +252,10 @@ why the plugin needs FreeBSD 14.0 or newer: `route -j` is not in 13.
 - `get_jail_id` falls back to progressively looser matches against `jls` output,
   the last of which greps the whole line — a container id prefix appearing in a
   path could in principle select the wrong jail.
+- A DHCP lease is taken once, at `ADD`, and never renewed or released: the
+  interface is in the jail by then, out of the host's reach, and a container
+  has no `dhclient` of its own. Give DHCP containers a reservation, or the
+  server may hand the address to something else once the lease runs out.
 - JSON is parsed with `sed` and `grep` to avoid a `jq` dependency, so keys are
   matched anywhere in the document rather than at a known position. This holds
   because CNI configs are small and flat.
