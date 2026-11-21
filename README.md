@@ -187,6 +187,30 @@ bridge of its own (`ept0`), so an installed `epair` and its networks are
 untouched, and removes everything on exit. Without `DHCP_BRIDGE` the DHCP
 check is skipped.
 
+## netavark
+
+The same script is a network driver for podman's netavark backend. Installed
+in one of netavark's plugin directories it answers `info`, `create`, `setup`
+and `teardown`, and does for a container what it does under CNI: an epair on
+your bridge, MAC, VLAN, MTU, and a DHCP lease when podman passes no address.
+
+```sh
+install -m 555 epair /usr/local/libexec/netavark/epair
+
+# addresses from the LAN's DHCP server
+podman network create -d epair --interface-name lanbridge --ipam-driver none lan
+
+# one container on a fixed address instead
+podman run --network lan --ip 192.168.4.9 ...
+```
+
+Options (`--opt`): `mtu`, `vlan`, `taggedVlans` as under CNI, and
+`lease_dns=true` to give containers the DNS server from the DHCP lease.
+That is off by default: podman writes the DNS servers of all of a
+container's networks into resolv.conf in no fixed order, and on a container
+that is also on a network with name resolution the LAN's server can come
+first and answer "no such name" for the other containers.
+
 ## Install
 
 ```sh

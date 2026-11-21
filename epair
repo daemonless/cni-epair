@@ -292,6 +292,10 @@ cmd_add() {
         if [ -n "$mac" ]; then
             log "ADD: Using MAC from CNI_ARGS: $mac"
         fi
+        # A caller that knows the segment's routers says so, in place of the
+        # .1 guess above (the netavark mode does).
+        [ -n "$ip" ] && [ -n "$CNI_EPAIR_GATEWAY" ] && gateway="$CNI_EPAIR_GATEWAY"
+        [ -n "$ip6" ] && [ -n "$CNI_EPAIR_GATEWAY6" ] && gateway6="$CNI_EPAIR_GATEWAY6"
     fi
 
     # Ask IPAM for whichever family the args did not supply. Gating this on
@@ -589,6 +593,152 @@ cmd_version() {
 }
 EOF
 }
+
+# ---------------------------------------------------------------------------
+# netavark plugin mode
+#
+# The same file installed in a netavark plugin directory is a network driver
+# for podman's netavark backend: `podman network create -d epair
+# --interface-name <bridge> --ipam-driver none <name>`. netavark calls it as
+# `epair info|create|setup <container>|teardown <container>` with JSON on
+# stdin. setup and teardown translate to the CNI ADD and DEL above, so both
+# backends get the same epair, MAC, VLAN, MTU and DHCP behaviour.
+#
+# Addresses: the ones podman passes (--ip, or its own pool when the network
+# has a subnet) are used as given; with none, the segment's DHCP server is
+# asked.
+# ---------------------------------------------------------------------------
+
+nv_die() {
+    log "netavark ERROR: $1"
+    printf '{"error":"%s"}\n' "$(printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g')"
+    exit 1
+}
+
+# nv_str <json> <key> -- the first "key":"value"
+nv_str() {
+    printf '%s' "$1" | grep -o "\"$2\"[[:space:]]*:[[:space:]]*\"[^\"]*\"" | head -1 | sed 's/.*"\([^"]*\)"$/\1/'
+}
+
+# nv_list <json> <key> -- every "key":"value", one per line
+nv_list() {
+    printf '%s' "$1" | grep -o "\"$2\"[[:space:]]*:[[:space:]]*\"[^\"]*\"" | sed 's/.*"\([^"]*\)"$/\1/'
+}
+
+nv_bridge() {
+    local b=$(nv_str "$1" network_interface)
+    [ -n "$b" ] || b=$(nv_str "$1" bridge)
+    [ -n "$b" ] || b=$(nv_str "$1" parent)
+    echo "$b"
+}
+
+nv_create() {
+    local in="$1"
+    [ -n "$(nv_bridge "$in")" ] ||
+        nv_die "name the bridge to join: podman network create -d epair --interface-name <bridge> ..."
+    printf '%s\n' "$in"
+}
+
+nv_setup() {
+    local id="$1" in="$2"
+    [ -n "$id" ] || nv_die "setup needs the container id"
+    local bridge=$(nv_bridge "$in")
+    [ -n "$bridge" ] || nv_die "the network names no bridge"
+    local ifname=$(nv_str "$in" interface_name)
+    local name=$(nv_str "$in" container_name)
+    local mac=$(nv_str "$in" static_mac)
+    local mtu=$(nv_str "$in" mtu)
+    local vlan=$(nv_str "$in" vlan)
+    local tagged=$(nv_str "$in" taggedVlans)
+
+    # The segment, per family, from the network's subnets.
+    local pfx4=24 pfx6=64 gw4="" gw6="" v
+    for v in $(nv_list "$in" subnet); do
+        if is_v6 "$v"; then pfx6="${v##*/}"; else pfx4="${v##*/}"; fi
+    done
+    for v in $(nv_list "$in" gateway); do
+        if is_v6 "$v"; then gw6="$v"; else gw4="$v"; fi
+    done
+
+    local args="K8S_POD_NAME=$name" ipam=dhcp
+    [ -n "$mac" ] && args="$args;MAC=$mac"
+    for v in $(printf '%s' "$in" | grep -o '"static_ips"[[:space:]]*:[[:space:]]*\[[^]]*\]' | grep -o '"[0-9a-fA-F:.]*"' | tr -d '"'); do
+        if is_v6 "$v"; then
+            args="$args;IP=$v/$pfx6"
+        else
+            args="$args;IP=$v/$pfx4"
+            ipam=static
+        fi
+    done
+
+    local conf="{\"cniVersion\":\"1.0.0\",\"name\":\"$(nv_str "$in" name)\",\"type\":\"epair\",\"master\":\"$bridge\""
+    [ -n "$mtu" ] && conf="$conf,\"mtu\":\"$mtu\""
+    [ -n "$vlan" ] && conf="$conf,\"vlan\":\"$vlan\""
+    [ -n "$tagged" ] && conf="$conf,\"taggedVlans\":\"$tagged\""
+    conf="$conf,\"ipam\":{\"type\":\"$ipam\"}}"
+
+    local out rc
+    out=$(printf '%s' "$conf" | CNI_COMMAND=ADD CNI_CONTAINERID="$id" CNI_NETNS="$id" \
+        CNI_IFNAME="${ifname:-eth0}" CNI_ARGS="$args" \
+        CNI_EPAIR_GATEWAY="$gw4" CNI_EPAIR_GATEWAY6="$gw6" "$0")
+    rc=$?
+    if [ "$rc" -ne 0 ]; then
+        local msg=$(nv_str "$out" msg)
+        nv_die "${msg:-the epair plugin failed}"
+    fi
+
+    # The CNI result, as netavark's status block. The container's interface is
+    # the second one listed.
+    local cmac=$(nv_list "$out" mac | sed -n 2p)
+    # The lease's DNS server is passed on only where the network asks for it
+    # (--opt lease_dns=true). podman writes the servers of all of a
+    # container's networks into resolv.conf in no fixed order, so on a
+    # container that is also on a network with name resolution the LAN's
+    # server can come first and answer "no such name" for the other
+    # containers. Without it podman uses its own DNS server where there is
+    # one, which forwards everything else, and the host's resolvers otherwise.
+    local dns=""
+    if [ "$(nv_str "$in" lease_dns)" = true ]; then
+        dns=$(printf '%s' "$out" | tr -d '\n' | grep -o '"nameservers"[[:space:]]*:[[:space:]]*\[[^]]*\]' | grep -o '"[0-9a-fA-F:.]*"' | head -1)
+    fi
+    local subnets="" sep="" addr gw
+    for addr in $(nv_list "$out" address); do
+        if is_v6 "$addr"; then gw=$(nv_list "$out" gateway | grep : | head -1); else gw=$(nv_list "$out" gateway | grep -v : | grep . | head -1); fi
+        subnets="$subnets$sep{\"ipnet\":\"$addr\"${gw:+,\"gateway\":\"$gw\"}}"
+        sep=","
+    done
+    printf '{"dns_search_domains":[],"dns_server_ips":[%s],"interfaces":{"%s":{"mac_address":"%s","subnets":[%s]}}}\n' \
+        "$dns" "${ifname:-eth0}" "$cmac" "$subnets"
+}
+
+nv_teardown() {
+    local id="$1"
+    [ -n "$id" ] || nv_die "teardown needs the container id"
+    printf '%s' '{"cniVersion":"1.0.0","type":"epair","ipam":{"type":"none"}}' |
+        CNI_COMMAND=DEL CNI_CONTAINERID="$id" "$0" >/dev/null
+}
+
+case "${1:-}" in
+    info)
+        echo '{"version":"0.4.0","api_version":"1.0.0"}'
+        exit 0
+        ;;
+    create)
+        nv_create "$(read_config)"
+        exit 0
+        ;;
+    setup)
+        log "netavark: setup $2"
+        nv_setup "$2" "$(read_config)"
+        exit 0
+        ;;
+    teardown)
+        log "netavark: teardown $2"
+        cat >/dev/null
+        nv_teardown "$2"
+        exit 0
+        ;;
+esac
 
 # Main
 log "Called: CNI_COMMAND=$CNI_COMMAND"
