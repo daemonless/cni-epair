@@ -76,22 +76,19 @@ that `epair` did not install itself before adding its own. FreeBSD enables
 `net.route.multipath=1` by default, so adding without replacing a foreign
 gateway would leave a container attached to both a LAN network and a private
 bridge network with two multipath default routes. Because `epair` records its
-own installed gateways per container (`<id>.gw` in the state dir), later
-`epair` networks on the same container keep the first `epair` gateway rather
-than overwriting each other.
-
-When a container joins several `epair` LAN networks, the first `epair` network
-attached keeps the default route:
+own installed gateways and network names per container (`<id>.gw` in the state
+dir), later `epair` networks keep a single `epair` default deterministically:
 
 - Under `netavark` on Podman 6, plugins run in `--network` (or Compose
-  `networks:`) order, so the first `epair` network listed keeps the default.
+  `networks:`) order, so the first `epair` network attached keeps the default.
 - Under `netavark` on Podman 5, network names run in alphabetical order, so the
-  alphabetically first `epair` network keeps the default.
-- Under `CNI` on Podman 5, Podman iterates a Go map when calling plugins, so a
-  single LAN network keeps the default without multipath routes, but which LAN
-  runs first is non-deterministic across starts (and if a CNI `bridge` network
-  runs after the last `epair`, that CNI `bridge` plugin still appends its own
-  default route).
+  first `epair` network attached (also the alphabetically first) keeps the default.
+- Under `CNI` on Podman 5, Podman iterates a Go map when calling plugins; `epair`
+  records the winning network name with the gateway and replaces it only when a
+  later `ADD` has an alphabetically earlier network name, so the alphabetically
+  first `epair` network keeps the default across starts despite CNI's map order
+  (note: if a CNI `bridge` network runs after the last `epair`, that CNI
+  `bridge` plugin still appends its own default route).
 
 It shells out to the IPAM plugin named in the network config (`host-local` on
 these hosts) rather than allocating addresses itself, found on the runtime's

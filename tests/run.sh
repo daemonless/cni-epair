@@ -107,6 +107,7 @@ not_called() {
     if grep -q -- "$2" "$STUB_LOG"; then bad "$1" "$(grep -- "$2" "$STUB_LOG")"; else ok "$1"; fi
 }
 conf() { echo "{\"cniVersion\":\"1.0.0\",\"name\":\"t\",\"type\":\"epair\",\"master\":\"bridge0\"$1,\"ipam\":{\"type\":\"$2\"}}"; }
+conf_named() { local n=$1; shift; echo "{\"cniVersion\":\"1.0.0\",\"name\":\"$n\",\"type\":\"epair\",\"master\":\"bridge0\"$1,\"ipam\":{\"type\":\"$2\"}}"; }
 
 # --- a static address from CNI_ARGS (foreign v4 default replaced; v6 untouched)
 rm -f "$T/state/$CNI_CONTAINERID.gw"
@@ -120,7 +121,7 @@ called "static: adds v4 default route" "route -j 7 add default 10.0.0.1"
 not_called "static: does not touch v6 default route" "delete -inet6 default"
 not_called "static: no MTU set on a 1500 bridge" " mtu "
 [ "$(cat "$T/state/$CNI_CONTAINERID")" = epair0a ] && ok "static: state recorded" || bad "static: state recorded"
-grep -qxF "7 inet 10.0.0.1" "$T/state/$CNI_CONTAINERID.gw" && ok "static: gateway recorded" || bad "static: gateway recorded"
+grep -qxF "7 inet 10.0.0.1 t" "$T/state/$CNI_CONTAINERID.gw" && ok "static: gateway and network name recorded" || bad "static: gateway and network name recorded"
 
 rm -f "$T/state/$CNI_CONTAINERID.gw"
 run ADD "$(conf '' static)" CNI_ARGS="IP=fd00::5/64" CURRENT_GW4="10.99.0.1" CURRENT_GW6="fd99::1"
@@ -193,39 +194,59 @@ run ADD "$(conf '' no-such-ipam)" CNI_ARGS=""
 check "missing IPAM: refused by name" '.code == 100 and (.msg | test("no-such-ipam"))'
 
 # --- multi-LAN and mixed LAN + private route reconciliation (CNI)
-# 1) Two epair networks (lan1 -> lan2): 1st sets default, 2nd keeps it
+# CNI keeps whichever epair network name sorts first alphabetically.
+# 1) lan1 -> lan2: lan1 (< lan2) installs default, lan2 keeps it
 rm -f "$T/state/$CNI_CONTAINERID.gw"
-run ADD "$(conf '' static)" CNI_ARGS="IP=192.168.86.10/24" CNI_IFNAME=eth0 CURRENT_GW4=""
-called "cni 2-epair A: 1st installs default" "route -j 7 add default 192.168.86.1"
-run ADD "$(conf '' static)" CNI_ARGS="IP=192.168.4.10/24" CNI_IFNAME=eth1 CURRENT_GW4="192.168.86.1"
-not_called "cni 2-epair A: 2nd does not delete 1st default" "route -j 7 delete"
-not_called "cni 2-epair A: 2nd does not add its default" "route -j 7 add default"
+run ADD "$(conf_named lan1 '' static)" CNI_ARGS="IP=192.168.86.10/24" CNI_IFNAME=eth0 CURRENT_GW4=""
+called "cni 2-epair A: lan1 installs default" "route -j 7 add default 192.168.86.1"
+run ADD "$(conf_named lan2 '' static)" CNI_ARGS="IP=192.168.4.10/24" CNI_IFNAME=eth1 CURRENT_GW4="192.168.86.1"
+not_called "cni 2-epair A: lan2 does not delete lan1 default" "route -j 7 delete"
+not_called "cni 2-epair A: lan2 does not add its default" "route -j 7 add default"
 
-# 2) Reverse order (lan2 -> lan1): 1st (lan2) keeps default
+# 2) Reverse order (lan2 -> lan1): lan1 (< lan2) replaces lan2's default
 rm -f "$T/state/$CNI_CONTAINERID.gw"
-run ADD "$(conf '' static)" CNI_ARGS="IP=192.168.4.10/24" CNI_IFNAME=eth0 CURRENT_GW4=""
-called "cni 2-epair B: 1st (lan2) installs default" "route -j 7 add default 192.168.4.1"
-run ADD "$(conf '' static)" CNI_ARGS="IP=192.168.86.10/24" CNI_IFNAME=eth1 CURRENT_GW4="192.168.4.1"
-not_called "cni 2-epair B: 2nd does not delete lan2 default" "route -j 7 delete"
-not_called "cni 2-epair B: 2nd does not add its default" "route -j 7 add default"
+run ADD "$(conf_named lan2 '' static)" CNI_ARGS="IP=192.168.4.10/24" CNI_IFNAME=eth0 CURRENT_GW4=""
+called "cni 2-epair B: lan2 installs initial default" "route -j 7 add default 192.168.4.1"
+run ADD "$(conf_named lan1 '' static)" CNI_ARGS="IP=192.168.86.10/24" CNI_IFNAME=eth1 CURRENT_GW4="192.168.4.1"
+called "cni 2-epair B: lan1 deletes lan2 default" "route -j 7 delete default 192.168.4.1"
+called "cni 2-epair B: lan1 installs winning default" "route -j 7 add default 192.168.86.1"
 
-# 3) Private -> lan1 -> lan2: lan1 deletes priv, lan2 keeps lan1
+# 3) 3-LAN reverse order (vlan5 -> vlan4 -> lan86): lan86 ends up owning default
 rm -f "$T/state/$CNI_CONTAINERID.gw"
-run ADD "$(conf '' static)" CNI_ARGS="IP=192.168.86.10/24" CNI_IFNAME=eth1 CURRENT_GW4="10.89.0.1"
-called "cni priv->lan1->lan2: lan1 replaces foreign 10.89.0.1" "route -j 7 delete default 10.89.0.1"
-called "cni priv->lan1->lan2: lan1 installs 192.168.86.1" "route -j 7 add default 192.168.86.1"
-run ADD "$(conf '' static)" CNI_ARGS="IP=192.168.4.10/24" CNI_IFNAME=eth2 CURRENT_GW4="192.168.86.1"
-not_called "cni priv->lan1->lan2: lan2 keeps lan1 default" "route -j 7 delete"
-not_called "cni priv->lan1->lan2: lan2 adds nothing" "route -j 7 add default"
+run ADD "$(conf_named vlan5 '' static)" CNI_ARGS="IP=192.168.5.10/24" CNI_IFNAME=eth0 CURRENT_GW4=""
+called "cni 3-epair: vlan5 installs 192.168.5.1" "route -j 7 add default 192.168.5.1"
+run ADD "$(conf_named vlan4 '' static)" CNI_ARGS="IP=192.168.4.10/24" CNI_IFNAME=eth1 CURRENT_GW4="192.168.5.1"
+called "cni 3-epair: vlan4 replaces vlan5" "route -j 7 delete default 192.168.5.1"
+called "cni 3-epair: vlan4 installs 192.168.4.1" "route -j 7 add default 192.168.4.1"
+run ADD "$(conf_named lan86 '' static)" CNI_ARGS="IP=192.168.86.10/24" CNI_IFNAME=eth2 CURRENT_GW4="192.168.4.1"
+called "cni 3-epair: lan86 replaces vlan4" "route -j 7 delete default 192.168.4.1"
+called "cni 3-epair: lan86 installs 192.168.86.1" "route -j 7 add default 192.168.86.1"
 
-# 4) lan1 -> private (ECMP added 10.89.0.1 alongside 192.168.86.1) -> lan2:
-# lan2 strips ONLY 10.89.0.1 and keeps 192.168.86.1!
+# 4) Private -> lan86 -> vlan4: lan86 deletes priv, vlan4 keeps lan86
 rm -f "$T/state/$CNI_CONTAINERID.gw"
-run ADD "$(conf '' static)" CNI_ARGS="IP=192.168.86.10/24" CNI_IFNAME=eth0 CURRENT_GW4=""
-run ADD "$(conf '' static)" CNI_ARGS="IP=192.168.4.10/24" CNI_IFNAME=eth2 CURRENT_GW4="192.168.86.1 10.89.0.1"
-called "cni lan1->priv->lan2: lan2 deletes foreign 10.89.0.1" "route -j 7 delete default 10.89.0.1"
-not_called "cni lan1->priv->lan2: lan2 keeps 192.168.86.1" "delete default 192.168.86.1"
-not_called "cni lan1->priv->lan2: lan2 adds no third default" "route -j 7 add default"
+run ADD "$(conf_named lan86 '' static)" CNI_ARGS="IP=192.168.86.10/24" CNI_IFNAME=eth1 CURRENT_GW4="10.89.0.1"
+called "cni priv->lan86->vlan4: lan86 replaces foreign 10.89.0.1" "route -j 7 delete default 10.89.0.1"
+called "cni priv->lan86->vlan4: lan86 installs 192.168.86.1" "route -j 7 add default 192.168.86.1"
+run ADD "$(conf_named vlan4 '' static)" CNI_ARGS="IP=192.168.4.10/24" CNI_IFNAME=eth2 CURRENT_GW4="192.168.86.1"
+not_called "cni priv->lan86->vlan4: vlan4 keeps lan86 default" "route -j 7 delete"
+not_called "cni priv->lan86->vlan4: vlan4 adds nothing" "route -j 7 add default"
+
+# 5) lan86 -> private (ECMP added 10.89.0.1 alongside 192.168.86.1) -> vlan4:
+# vlan4 strips ONLY foreign 10.89.0.1 and keeps lan86 (192.168.86.1)
+rm -f "$T/state/$CNI_CONTAINERID.gw"
+run ADD "$(conf_named lan86 '' static)" CNI_ARGS="IP=192.168.86.10/24" CNI_IFNAME=eth0 CURRENT_GW4=""
+run ADD "$(conf_named vlan4 '' static)" CNI_ARGS="IP=192.168.4.10/24" CNI_IFNAME=eth2 CURRENT_GW4="192.168.86.1 10.89.0.1"
+called "cni lan86->priv->vlan4: vlan4 deletes foreign 10.89.0.1" "route -j 7 delete default 10.89.0.1"
+not_called "cni lan86->priv->vlan4: vlan4 keeps 192.168.86.1" "delete default 192.168.86.1"
+not_called "cni lan86->priv->vlan4: vlan4 adds no third default" "route -j 7 add default"
+
+# 6) vlan4 -> priv -> lan86: lan86 strips foreign 10.89.0.1 AND replaces vlan4
+rm -f "$T/state/$CNI_CONTAINERID.gw"
+run ADD "$(conf_named vlan4 '' static)" CNI_ARGS="IP=192.168.4.10/24" CNI_IFNAME=eth0 CURRENT_GW4=""
+run ADD "$(conf_named lan86 '' static)" CNI_ARGS="IP=192.168.86.10/24" CNI_IFNAME=eth2 CURRENT_GW4="192.168.4.1 10.89.0.1"
+called "cni vlan4->priv->lan86: lan86 deletes foreign 10.89.0.1" "route -j 7 delete default 10.89.0.1"
+called "cni vlan4->priv->lan86: lan86 replaces vlan4 default" "route -j 7 delete default 192.168.4.1"
+called "cni vlan4->priv->lan86: lan86 installs 192.168.86.1" "route -j 7 add default 192.168.86.1"
 
 # --- DEL destroys the epair, removes .gw state, and releases the addresses
 echo epair0a > "$T/state/$CNI_CONTAINERID"
@@ -281,14 +302,15 @@ called "netavark static: deletes foreign default route" "route -j 7 delete defau
 called "netavark static: the network's gateway, not a guess" "route -j 7 add default 10.0.0.254"
 not_called "netavark static: no DHCP request" "dhclient"
 
-# Multi-LAN and mixed under netavark mode: priv -> lan1 -> lan2 keeps lan1
+# Multi-LAN and mixed under netavark mode: first attached wins (even if a later name sorts first)
+nvnet_named() { echo "{\"container_id\":\"$ID\",\"container_name\":\"Web_App\",\"network\":{\"driver\":\"epair\",\"name\":\"$1\",\"network_interface\":\"bridge0\"$2},\"network_options\":{\"interface_name\":\"eth0\"$3}}"; }
 rm -f "$T/state/$ID.gw"
-nv setup "$ID" "$(nvnet ',"subnets":[{"gateway":"192.168.86.1","subnet":"192.168.86.0/24"}]' ',"static_ips":["192.168.86.9"],"static_mac":null')" CURRENT_GW4="10.89.0.1"
-called "netavark priv->lan1->lan2: lan1 replaces 10.89.0.1" "route -j 7 delete default 10.89.0.1"
-called "netavark priv->lan1->lan2: lan1 adds 192.168.86.1" "route -j 7 add default 192.168.86.1"
-nv setup "$ID" "$(nvnet ',"subnets":[{"gateway":"192.168.4.1","subnet":"192.168.4.0/24"}]' ',"static_ips":["192.168.4.9"],"static_mac":null')" CURRENT_GW4="192.168.86.1"
-not_called "netavark priv->lan1->lan2: lan2 keeps lan1 default" "route -j 7 delete"
-not_called "netavark priv->lan1->lan2: lan2 adds nothing" "route -j 7 add default"
+nv setup "$ID" "$(nvnet_named nv-vlan4 ',"subnets":[{"gateway":"192.168.4.1","subnet":"192.168.4.0/24"}]' ',"static_ips":["192.168.4.9"],"static_mac":null')" CURRENT_GW4="10.89.0.1"
+called "netavark priv->vlan4->lan86: vlan4 replaces 10.89.0.1" "route -j 7 delete default 10.89.0.1"
+called "netavark priv->vlan4->lan86: vlan4 adds 192.168.4.1" "route -j 7 add default 192.168.4.1"
+nv setup "$ID" "$(nvnet_named nv-lan86 ',"subnets":[{"gateway":"192.168.86.1","subnet":"192.168.86.0/24"}]' ',"static_ips":["192.168.86.9"],"static_mac":null')" CURRENT_GW4="192.168.4.1"
+not_called "netavark priv->vlan4->lan86: lan86 keeps first attached (vlan4)" "route -j 7 delete"
+not_called "netavark priv->vlan4->lan86: lan86 adds nothing" "route -j 7 add default"
 
 nv setup "$ID" "$(nvnet '' ',"static_ips":["10.0.0.9"]')" FAIL_MATCH="vnet"
 [ "$rc" -eq 1 ] && ok "netavark failed move: exit 1" || bad "netavark failed move: exit $rc" "$out"

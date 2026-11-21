@@ -124,17 +124,34 @@ get_epair() {
 }
 
 save_gateway() {
-    local container_id="$1" jail_id="$2" fam="$3" gw="$4"
+    local container_id="$1" jail_id="$2" fam="$3" gw="$4" net_name="${5:-}"
     local state_dir="${CNI_EPAIR_STATE:-/var/run/cni/freebsd-epair}"
+    local file="$state_dir/$container_id.gw" tmp=""
     mkdir -p "$state_dir"
-    printf '%s %s %s\n' "$jail_id" "$fam" "$gw" >> "$state_dir/$container_id.gw"
+    if [ -f "$file" ]; then
+        tmp=$(awk -v j="$jail_id" -v f="$fam" '!($1 == j && $2 == f)' "$file" 2>/dev/null || true)
+    fi
+    {
+        [ -n "$tmp" ] && printf '%s\n' "$tmp"
+        printf '%s %s %s %s\n' "$jail_id" "$fam" "$gw" "$net_name"
+    } > "$file"
 }
 
 has_own_gateway() {
     local container_id="$1" jail_id="$2" fam="$3" gw="$4"
     local state_dir="${CNI_EPAIR_STATE:-/var/run/cni/freebsd-epair}"
     [ -f "$state_dir/$container_id.gw" ] &&
-        grep -qxF "$jail_id $fam $gw" "$state_dir/$container_id.gw" 2>/dev/null
+        awk -v j="$jail_id" -v f="$fam" -v g="$gw" \
+            '$1 == j && $2 == f && $3 == g { found=1; exit } END { exit !found }' \
+            "$state_dir/$container_id.gw" 2>/dev/null
+}
+
+own_gateway_info() {
+    local container_id="$1" jail_id="$2" fam="$3"
+    local state_dir="${CNI_EPAIR_STATE:-/var/run/cni/freebsd-epair}"
+    [ -f "$state_dir/$container_id.gw" ] &&
+        awk -v j="$jail_id" -v f="$fam" '$1 == j && $2 == f { print $3, $4; exit }' \
+            "$state_dir/$container_id.gw" 2>/dev/null
 }
 
 del_epair() {
@@ -143,13 +160,16 @@ del_epair() {
     rm -f "$state_dir/$container_id" "$state_dir/$container_id.gw" 2>/dev/null
 }
 
-# set_default_route <container_id> <jail_id> <inet|inet6> <gateway>
+# set_default_route <container_id> <jail_id> <inet|inet6> <gateway> <net_name>
 # Replaces any default route that epair did not install itself (such as a
-# private bridge network's gateway), while leaving an existing default route
-# added by an earlier epair network on this container untouched.
+# private bridge network's gateway). When an earlier epair network already
+# installed a default for this family:
+# - netavark mode (CNI_EPAIR_NETAVARK=1): keep the first attached default
+# - CNI mode: keep whichever network name sorts first alphabetically so
+#   Podman's CNI Go-map iteration order cannot flip the default across starts.
 set_default_route() {
-    local container_id="$1" jail_id="$2" fam="$3" gw="$4"
-    local flag="" have_own="" cur
+    local container_id="$1" jail_id="$2" fam="$3" gw="$4" net_name="${5:-}"
+    local flag="" have_own="" cur cur_info="" cur_gw="" cur_net=""
     [ "$fam" = "inet6" ] && flag="-inet6"
 
     for cur in $(netstat -j "$jail_id" -rn -f "$fam" 2>/dev/null | awk '$1 == "default" { print $2 }'); do
@@ -163,7 +183,23 @@ set_default_route() {
 
     if [ -z "$have_own" ]; then
         if route -j "$jail_id" add $flag default "$gw" >/dev/null 2>&1; then
-            save_gateway "$container_id" "$jail_id" "$fam" "$gw"
+            save_gateway "$container_id" "$jail_id" "$fam" "$gw" "$net_name"
+        fi
+    elif [ "${CNI_EPAIR_NETAVARK:-}" != "1" ] && [ -n "$net_name" ]; then
+        cur_info=$(own_gateway_info "$container_id" "$jail_id" "$fam" || true)
+        cur_gw=${cur_info%% *}
+        cur_net=${cur_info#* }
+        [ "$cur_info" = "$cur_gw" ] && cur_net=""
+        if LC_ALL=C awk -v a="$net_name" -v b="$cur_net" 'BEGIN { exit !(a != "" && (b == "" || a < b)) }'; then
+            if [ "$gw" != "$cur_gw" ]; then
+                route -j "$jail_id" delete $flag default "$cur_gw" >/dev/null 2>&1 ||
+                    route -j "$jail_id" delete $flag default >/dev/null 2>&1 || true
+                if route -j "$jail_id" add $flag default "$gw" >/dev/null 2>&1; then
+                    save_gateway "$container_id" "$jail_id" "$fam" "$gw" "$net_name"
+                fi
+            else
+                save_gateway "$container_id" "$jail_id" "$fam" "$gw" "$net_name"
+            fi
         fi
     fi
 }
@@ -259,6 +295,7 @@ cmd_add() {
     log "ADD: config=$config"
 
     # Parse config - podman uses "master" for parent interface
+    local net_name=$(json_get_nested "$config" "name")
     local bridge=$(json_get "$config" "master")
     [ -z "$bridge" ] && bridge=$(json_get "$config" "bridge")
     # Both spellings ("mtu": 9000 and "mtu": "9000"); unset takes the bridge's
@@ -494,9 +531,9 @@ cmd_add() {
     fi
 
     # Replace any foreign default route (from a private bridge) while keeping
-    # any default route an earlier epair network already installed.
+    # epair-owned defaults according to backend rules.
     if [ -n "$gateway" ]; then
-        set_default_route "$CNI_CONTAINERID" "$jail_id" inet "$gateway"
+        set_default_route "$CNI_CONTAINERID" "$jail_id" inet "$gateway" "$net_name"
     fi
     if [ -n "$gateway6" ]; then
         # A link-local gateway is ambiguous without the interface it is on:
@@ -505,7 +542,7 @@ cmd_add() {
         case "$gateway6" in
             fe80:*|FE80:*) [ "${gateway6#*%}" = "$gateway6" ] && gateway6="$gateway6%$ifname" ;;
         esac
-        set_default_route "$CNI_CONTAINERID" "$jail_id" inet6 "$gateway6"
+        set_default_route "$CNI_CONTAINERID" "$jail_id" inet6 "$gateway6" "$net_name"
     fi
 
     # Configure loopback
@@ -727,7 +764,7 @@ nv_setup() {
     local out rc
     out=$(printf '%s' "$conf" | CNI_COMMAND=ADD CNI_CONTAINERID="$id" CNI_NETNS="$id" \
         CNI_IFNAME="${ifname:-eth0}" CNI_ARGS="$args" \
-        CNI_EPAIR_GATEWAY="$gw4" CNI_EPAIR_GATEWAY6="$gw6" "$0")
+        CNI_EPAIR_NETAVARK=1 CNI_EPAIR_GATEWAY="$gw4" CNI_EPAIR_GATEWAY6="$gw6" "$0")
     rc=$?
     if [ "$rc" -ne 0 ]; then
         local msg=$(nv_str "$out" msg)
