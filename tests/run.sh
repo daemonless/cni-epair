@@ -38,6 +38,23 @@ cat > "$T/bin/route" <<'EOF'
 echo "route $*" >> "$STUB_LOG"
 EOF
 
+cat > "$T/bin/netstat" <<'EOF'
+#!/bin/sh
+echo "netstat $*" >> "$STUB_LOG"
+case "$*" in
+*"-f inet6"*)
+    for gw in ${CURRENT_GW6:-}; do
+        printf 'default %s UGS eth0\n' "$gw"
+    done
+    ;;
+*"-f inet"*)
+    for gw in ${CURRENT_GW4:-}; do
+        printf 'default %s UGS eth0\n' "$gw"
+    done
+    ;;
+esac
+EOF
+
 # dhclient: reads the plugin's config for its script, reports a lease through
 # it, then idles like the real one until the plugin kills it.
 cat > "$T/bin/dhclient" <<'EOF'
@@ -91,14 +108,25 @@ not_called() {
 }
 conf() { echo "{\"cniVersion\":\"1.0.0\",\"name\":\"t\",\"type\":\"epair\",\"master\":\"bridge0\"$1,\"ipam\":{\"type\":\"$2\"}}"; }
 
-# --- a static address from CNI_ARGS
-run ADD "$(conf '' static)" CNI_ARGS="IP=10.0.0.5/24"
+# --- a static address from CNI_ARGS (foreign v4 default replaced; v6 untouched)
+rm -f "$T/state/$CNI_CONTAINERID.gw"
+run ADD "$(conf '' static)" CNI_ARGS="IP=10.0.0.5/24" CURRENT_GW4="10.99.0.1"
 [ "$rc" -eq 0 ] && ok "static: exit 0" || bad "static: exit $rc" "$out"
 check "static: address and guessed gateway" '.ips[0].address == "10.0.0.5/24" and .ips[0].gateway == "10.0.0.1"'
 check "static: no dns without a lease" 'has("dns") | not'
 called "static: address set in the jail" "ifconfig -j 7 eth0 inet 10.0.0.5/24"
+called "static: deletes foreign v4 default route" "route -j 7 delete default 10.99.0.1"
+called "static: adds v4 default route" "route -j 7 add default 10.0.0.1"
+not_called "static: does not touch v6 default route" "delete -inet6 default"
 not_called "static: no MTU set on a 1500 bridge" " mtu "
 [ "$(cat "$T/state/$CNI_CONTAINERID")" = epair0a ] && ok "static: state recorded" || bad "static: state recorded"
+grep -qxF "7 inet 10.0.0.1" "$T/state/$CNI_CONTAINERID.gw" && ok "static: gateway recorded" || bad "static: gateway recorded"
+
+rm -f "$T/state/$CNI_CONTAINERID.gw"
+run ADD "$(conf '' static)" CNI_ARGS="IP=fd00::5/64" CURRENT_GW4="10.99.0.1" CURRENT_GW6="fd99::1"
+[ "$rc" -eq 0 ] && ok "static v6 without gateway: exit 0" || bad "static v6 without gateway: exit $rc" "$out"
+not_called "static v6 without gateway: keeps existing v4 default" "delete default"
+not_called "static v6 without gateway: keeps existing v6 default" "delete -inet6 default"
 
 # --- MTU, as a number and as a string
 for m in 9000 '"9000"'; do
@@ -148,20 +176,65 @@ run ADD "$(conf ',"leaseDns":true' dhcp)" CNI_ARGS="K8S_POD_NAME=web"
 check "dhcp with leaseDns: lease DNS in the result" '.dns.nameservers == ["192.168.1.53"]'
 
 # --- host-local from CNI_PATH, both families in either order
-run ADD "$(conf '' host-local)" CNI_ARGS=""
+rm -f "$T/state/$CNI_CONTAINERID.gw"
+run ADD "$(conf '' host-local)" CNI_ARGS="" CURRENT_GW4="10.99.0.1" CURRENT_GW6="fd99::1"
 check "host-local: v4 and v6" '[.ips[].address] == ["10.88.0.5/24", "fd00::5/64"]'
 check "host-local: gateways by family" '[.ips[].gateway] == ["10.88.0.1", "fd00::1"]'
 called "host-local: v6 enabled first" "ifconfig -j 7 eth0 inet6 -ifdisabled"
+called "host-local: deletes foreign v4 default" "route -j 7 delete default 10.99.0.1"
+called "host-local: adds v4 default" "route -j 7 add default 10.88.0.1"
+called "host-local: deletes foreign v6 default" "route -j 7 delete -inet6 default fd99::1"
+called "host-local: adds v6 default" "route -j 7 add -inet6 default fd00::1"
+awk '/^route -j 7 delete default 10\.99\.0\.1$/{d=NR} /^route -j 7 add default 10\.88\.0\.1$/{a=NR} END{exit !(d && a && d<a)}' "$STUB_LOG" &&
+    ok "host-local: v4 delete precedes add" || bad "host-local: v4 delete order" "$(cat "$STUB_LOG")"
+awk '/^route -j 7 delete -inet6 default fd99::1$/{d=NR} /^route -j 7 add -inet6 default fd00::1$/{a=NR} END{exit !(d && a && d<a)}' "$STUB_LOG" &&
+    ok "host-local: v6 delete precedes add" || bad "host-local: v6 delete order" "$(cat "$STUB_LOG")"
 run ADD "$(conf '' no-such-ipam)" CNI_ARGS=""
 check "missing IPAM: refused by name" '.code == 100 and (.msg | test("no-such-ipam"))'
 
-# --- DEL destroys the epair and releases the addresses
+# --- multi-LAN and mixed LAN + private route reconciliation (CNI)
+# 1) Two epair networks (lan1 -> lan2): 1st sets default, 2nd keeps it
+rm -f "$T/state/$CNI_CONTAINERID.gw"
+run ADD "$(conf '' static)" CNI_ARGS="IP=192.168.86.10/24" CNI_IFNAME=eth0 CURRENT_GW4=""
+called "cni 2-epair A: 1st installs default" "route -j 7 add default 192.168.86.1"
+run ADD "$(conf '' static)" CNI_ARGS="IP=192.168.4.10/24" CNI_IFNAME=eth1 CURRENT_GW4="192.168.86.1"
+not_called "cni 2-epair A: 2nd does not delete 1st default" "route -j 7 delete"
+not_called "cni 2-epair A: 2nd does not add its default" "route -j 7 add default"
+
+# 2) Reverse order (lan2 -> lan1): 1st (lan2) keeps default
+rm -f "$T/state/$CNI_CONTAINERID.gw"
+run ADD "$(conf '' static)" CNI_ARGS="IP=192.168.4.10/24" CNI_IFNAME=eth0 CURRENT_GW4=""
+called "cni 2-epair B: 1st (lan2) installs default" "route -j 7 add default 192.168.4.1"
+run ADD "$(conf '' static)" CNI_ARGS="IP=192.168.86.10/24" CNI_IFNAME=eth1 CURRENT_GW4="192.168.4.1"
+not_called "cni 2-epair B: 2nd does not delete lan2 default" "route -j 7 delete"
+not_called "cni 2-epair B: 2nd does not add its default" "route -j 7 add default"
+
+# 3) Private -> lan1 -> lan2: lan1 deletes priv, lan2 keeps lan1
+rm -f "$T/state/$CNI_CONTAINERID.gw"
+run ADD "$(conf '' static)" CNI_ARGS="IP=192.168.86.10/24" CNI_IFNAME=eth1 CURRENT_GW4="10.89.0.1"
+called "cni priv->lan1->lan2: lan1 replaces foreign 10.89.0.1" "route -j 7 delete default 10.89.0.1"
+called "cni priv->lan1->lan2: lan1 installs 192.168.86.1" "route -j 7 add default 192.168.86.1"
+run ADD "$(conf '' static)" CNI_ARGS="IP=192.168.4.10/24" CNI_IFNAME=eth2 CURRENT_GW4="192.168.86.1"
+not_called "cni priv->lan1->lan2: lan2 keeps lan1 default" "route -j 7 delete"
+not_called "cni priv->lan1->lan2: lan2 adds nothing" "route -j 7 add default"
+
+# 4) lan1 -> private (ECMP added 10.89.0.1 alongside 192.168.86.1) -> lan2:
+# lan2 strips ONLY 10.89.0.1 and keeps 192.168.86.1!
+rm -f "$T/state/$CNI_CONTAINERID.gw"
+run ADD "$(conf '' static)" CNI_ARGS="IP=192.168.86.10/24" CNI_IFNAME=eth0 CURRENT_GW4=""
+run ADD "$(conf '' static)" CNI_ARGS="IP=192.168.4.10/24" CNI_IFNAME=eth2 CURRENT_GW4="192.168.86.1 10.89.0.1"
+called "cni lan1->priv->lan2: lan2 deletes foreign 10.89.0.1" "route -j 7 delete default 10.89.0.1"
+not_called "cni lan1->priv->lan2: lan2 keeps 192.168.86.1" "delete default 192.168.86.1"
+not_called "cni lan1->priv->lan2: lan2 adds no third default" "route -j 7 add default"
+
+# --- DEL destroys the epair, removes .gw state, and releases the addresses
 echo epair0a > "$T/state/$CNI_CONTAINERID"
 run DEL "$(conf '' host-local)"
 [ "$rc" -eq 0 ] && ok "del: exit 0" || bad "del: exit $rc" "$out"
 called "del: epair destroyed" "ifconfig epair0a destroy"
 called "del: addresses released" "host-local DEL"
 [ ! -e "$T/state/$CNI_CONTAINERID" ] && ok "del: state removed" || bad "del: state removed"
+[ ! -e "$T/state/$CNI_CONTAINERID.gw" ] && ok "del: gateway state removed" || bad "del: gateway state removed"
 
 run VERSION "{}"
 check "version: lists 1.0.0" '.supportedVersions | index("1.0.0")'
@@ -200,11 +273,22 @@ check "netavark lease_dns: the lease's server is passed on" '.dns_server_ips == 
 check "netavark: the MAC the interface has" '.interfaces.eth0.mac_address == "02:00:00:00:00:0b"'
 called "netavark: mtu from the network's options" "ifconfig epair0b mtu 9000"
 
-nv setup "$ID" "$(nvnet ',"subnets":[{"gateway":"10.0.0.254","subnet":"10.0.0.0/16"}]' ',"static_ips":["10.0.0.9"],"static_mac":null')"
+rm -f "$T/state/$ID.gw"
+nv setup "$ID" "$(nvnet ',"subnets":[{"gateway":"10.0.0.254","subnet":"10.0.0.0/16"}]' ',"static_ips":["10.0.0.9"],"static_mac":null')" CURRENT_GW4="10.99.0.1"
 check "netavark static: podman's address with the subnet's prefix and gateway" '.interfaces.eth0.subnets == [{"ipnet":"10.0.0.9/16","gateway":"10.0.0.254"}]'
 called "netavark static: address set in the jail" "ifconfig -j 7 eth0 inet 10.0.0.9/16"
+called "netavark static: deletes foreign default route" "route -j 7 delete default 10.99.0.1"
 called "netavark static: the network's gateway, not a guess" "route -j 7 add default 10.0.0.254"
 not_called "netavark static: no DHCP request" "dhclient"
+
+# Multi-LAN and mixed under netavark mode: priv -> lan1 -> lan2 keeps lan1
+rm -f "$T/state/$ID.gw"
+nv setup "$ID" "$(nvnet ',"subnets":[{"gateway":"192.168.86.1","subnet":"192.168.86.0/24"}]' ',"static_ips":["192.168.86.9"],"static_mac":null')" CURRENT_GW4="10.89.0.1"
+called "netavark priv->lan1->lan2: lan1 replaces 10.89.0.1" "route -j 7 delete default 10.89.0.1"
+called "netavark priv->lan1->lan2: lan1 adds 192.168.86.1" "route -j 7 add default 192.168.86.1"
+nv setup "$ID" "$(nvnet ',"subnets":[{"gateway":"192.168.4.1","subnet":"192.168.4.0/24"}]' ',"static_ips":["192.168.4.9"],"static_mac":null')" CURRENT_GW4="192.168.86.1"
+not_called "netavark priv->lan1->lan2: lan2 keeps lan1 default" "route -j 7 delete"
+not_called "netavark priv->lan1->lan2: lan2 adds nothing" "route -j 7 add default"
 
 nv setup "$ID" "$(nvnet '' ',"static_ips":["10.0.0.9"]')" FAIL_MATCH="vnet"
 [ "$rc" -eq 1 ] && ok "netavark failed move: exit 1" || bad "netavark failed move: exit $rc" "$out"
