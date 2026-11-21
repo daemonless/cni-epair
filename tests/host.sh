@@ -94,7 +94,7 @@ grep -q 'mtu must be 576-65535' "$ERR" && ok "mtu 70000: the reason" || bad "mtu
 
 if [ -n "${DHCP_BRIDGE:-}" ]; then
     echo "== dhcp on $DHCP_BRIDGE"
-    net ept-dhcp "$DHCP_BRIDGE" '' '{"type": "dhcp"}'
+    net ept-dhcp "$DHCP_BRIDGE" ', "leaseDns": true' '{"type": "dhcp"}'
     if start ept-dhcp ept-dhcp; then
         lease=$(grep 'dhcp lease=' "$CNI_EPAIR_LOG" | tail -1 | sed 's/.*lease=//')
         echo "     lease: $lease"

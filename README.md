@@ -77,7 +77,7 @@ and `grep` to avoid a `jq` dependency.
 
 With `"ipam": {"type": "dhcp"}` the plugin asks the LAN's DHCP server itself,
 from the host, before the interface moves into the jail. The result carries the
-lease's address, gateway and DNS server.
+lease's address and gateway, and its DNS server with `"leaseDns": true`.
 
 Config keys, from the plugin's own header:
 
@@ -87,6 +87,7 @@ Config keys, from the plugin's own header:
 | `mtu` | no | MTU for both ends of the epair (576-65535), default the bridge's |
 | `vlan` | no | untagged VLAN ID (1-4094) for the epair on a `vlanfilter` bridge |
 | `taggedVlans` | no | VLANs the epair may carry tagged, in `ifconfig`'s list syntax: `"3,4"`, `"10-20"`, `"all"` |
+| `leaseDns` | no | `true` to return the DHCP lease's DNS server; off by default, because the runtime writes every network's servers into resolv.conf in no fixed order and this one can hide the names of a network with name resolution |
 
 `vlan` and `taggedVlans` become `ifconfig <bridge> addm <epair> untagged <vlan>
 tagged <list>`. They only filter on a bridge with `vlanfilter` set (FreeBSD
