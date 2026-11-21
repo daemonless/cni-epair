@@ -140,9 +140,12 @@ check "failed mtu: error names it" '.code == 100 and (.msg | test("MTU"))'
 run ADD "$(conf '' dhcp)" CNI_ARGS="K8S_POD_NAME=Web_App"
 [ "$rc" -eq 0 ] && ok "dhcp: exit 0" || bad "dhcp: exit $rc" "$out"
 check "dhcp: leased address" '.ips[0].address == "192.168.1.50/24" and .ips[0].gateway == "192.168.1.1"'
-check "dhcp: lease DNS in the result" '.dns.nameservers == ["192.168.1.53"]'
+check "dhcp: no lease DNS unless asked" 'has("dns") | not'
 grep -qF 'send host-name "web-app"' "$STUB_LOG" && ok "dhcp: asks under the container's name" || bad "dhcp: host-name" "$(cat "$STUB_LOG")"
 [ -z "$(ls "$T/run")" ] && ok "dhcp: run dir cleaned up" || bad "dhcp: run dir left" "$(ls -R "$T/run")"
+
+run ADD "$(conf ',"leaseDns":true' dhcp)" CNI_ARGS="K8S_POD_NAME=web"
+check "dhcp with leaseDns: lease DNS in the result" '.dns.nameservers == ["192.168.1.53"]'
 
 # --- host-local from CNI_PATH, both families in either order
 run ADD "$(conf '' host-local)" CNI_ARGS=""

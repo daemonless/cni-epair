@@ -10,6 +10,7 @@
 #   mtu: MTU for both ends of the epair (optional, 576-65535; default: the bridge's)
 #   vlan: untagged VLAN ID on a vlanfilter bridge (optional, 1-4094)
 #   taggedVlans: VLANs allowed tagged, ifconfig's list syntax (optional, "3,4", "10-20")
+#   leaseDns: true to return the DHCP lease's DNS server (optional; default: not returned)
 #
 # IPAM must provide:
 #   ips[].address: IP address with prefix (e.g., "192.168.86.8/24")
@@ -503,7 +504,12 @@ cmd_add() {
 )]$(
     # The lease's DNS server, the one thing a DHCP network knows that the
     # runtime does not.
-    [ -n "$dns" ] && printf ',\n  "dns": {"nameservers": ["%s"]}' "$dns"
+    # Only where the network asks ("leaseDns": true): the runtime writes
+    # every network's servers into resolv.conf in no fixed order, and on a
+    # container that is also on a network with name resolution this one
+    # can come first and answer "no such name" for the other containers.
+    [ -n "$dns" ] && echo "$config" | grep -q '"leaseDns"[[:space:]]*:[[:space:]]*"\{0,1\}true' &&
+        printf ',\n  "dns": {"nameservers": ["%s"]}' "$dns"
 )
 }
 EOF
@@ -675,6 +681,7 @@ nv_setup() {
     [ -n "$mtu" ] && conf="$conf,\"mtu\":\"$mtu\""
     [ -n "$vlan" ] && conf="$conf,\"vlan\":\"$vlan\""
     [ -n "$tagged" ] && conf="$conf,\"taggedVlans\":\"$tagged\""
+    [ "$(nv_str "$in" lease_dns)" = true ] && conf="$conf,\"leaseDns\":true"
     conf="$conf,\"ipam\":{\"type\":\"$ipam\"}}"
 
     local out rc
@@ -690,17 +697,9 @@ nv_setup() {
     # The CNI result, as netavark's status block. The container's interface is
     # the second one listed.
     local cmac=$(nv_list "$out" mac | sed -n 2p)
-    # The lease's DNS server is passed on only where the network asks for it
-    # (--opt lease_dns=true). podman writes the servers of all of a
-    # container's networks into resolv.conf in no fixed order, so on a
-    # container that is also on a network with name resolution the LAN's
-    # server can come first and answer "no such name" for the other
-    # containers. Without it podman uses its own DNS server where there is
-    # one, which forwards everything else, and the host's resolvers otherwise.
-    local dns=""
-    if [ "$(nv_str "$in" lease_dns)" = true ]; then
-        dns=$(printf '%s' "$out" | tr -d '\n' | grep -o '"nameservers"[[:space:]]*:[[:space:]]*\[[^]]*\]' | grep -o '"[0-9a-fA-F:.]*"' | head -1)
-    fi
+    # The lease's DNS server, where the network asked for it
+    # (--opt lease_dns=true); see leaseDns above for why not always.
+    local dns=$(printf '%s' "$out" | tr -d '\n' | grep -o '"nameservers"[[:space:]]*:[[:space:]]*\[[^]]*\]' | grep -o '"[0-9a-fA-F:.]*"' | head -1)
     local subnets="" sep="" addr gw
     for addr in $(nv_list "$out" address); do
         if is_v6 "$addr"; then gw=$(nv_list "$out" gateway | grep : | head -1); else gw=$(nv_list "$out" gateway | grep -v : | grep . | head -1); fi
