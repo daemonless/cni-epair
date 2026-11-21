@@ -108,7 +108,7 @@ get_jail_id() {
     echo "$jid"
 }
 
-# Track epair for cleanup
+# Track epair and installed default routes for cleanup and multi-network runs
 save_epair() {
     local container_id="$1"
     local epair_a="$2"
@@ -123,10 +123,49 @@ get_epair() {
     cat "$state_dir/$container_id" 2>/dev/null
 }
 
+save_gateway() {
+    local container_id="$1" jail_id="$2" fam="$3" gw="$4"
+    local state_dir="${CNI_EPAIR_STATE:-/var/run/cni/freebsd-epair}"
+    mkdir -p "$state_dir"
+    printf '%s %s %s\n' "$jail_id" "$fam" "$gw" >> "$state_dir/$container_id.gw"
+}
+
+has_own_gateway() {
+    local container_id="$1" jail_id="$2" fam="$3" gw="$4"
+    local state_dir="${CNI_EPAIR_STATE:-/var/run/cni/freebsd-epair}"
+    [ -f "$state_dir/$container_id.gw" ] &&
+        grep -qxF "$jail_id $fam $gw" "$state_dir/$container_id.gw" 2>/dev/null
+}
+
 del_epair() {
     local container_id="$1"
     local state_dir="${CNI_EPAIR_STATE:-/var/run/cni/freebsd-epair}"
-    rm -f "$state_dir/$container_id" 2>/dev/null
+    rm -f "$state_dir/$container_id" "$state_dir/$container_id.gw" 2>/dev/null
+}
+
+# set_default_route <container_id> <jail_id> <inet|inet6> <gateway>
+# Replaces any default route that epair did not install itself (such as a
+# private bridge network's gateway), while leaving an existing default route
+# added by an earlier epair network on this container untouched.
+set_default_route() {
+    local container_id="$1" jail_id="$2" fam="$3" gw="$4"
+    local flag="" have_own="" cur
+    [ "$fam" = "inet6" ] && flag="-inet6"
+
+    for cur in $(netstat -j "$jail_id" -rn -f "$fam" 2>/dev/null | awk '$1 == "default" { print $2 }'); do
+        if has_own_gateway "$container_id" "$jail_id" "$fam" "$cur"; then
+            have_own=yes
+        else
+            route -j "$jail_id" delete $flag default "$cur" >/dev/null 2>&1 ||
+                route -j "$jail_id" delete $flag default >/dev/null 2>&1 || true
+        fi
+    done
+
+    if [ -z "$have_own" ]; then
+        if route -j "$jail_id" add $flag default "$gw" >/dev/null 2>&1; then
+            save_gateway "$container_id" "$jail_id" "$fam" "$gw"
+        fi
+    fi
 }
 
 mask2prefix() {
@@ -454,9 +493,10 @@ cmd_add() {
             fail_add "could not set $ip6 on $ifname in jail $jail_id"
     fi
 
-    # Add gateway route
+    # Replace any foreign default route (from a private bridge) while keeping
+    # any default route an earlier epair network already installed.
     if [ -n "$gateway" ]; then
-        route -j "$jail_id" add default "$gateway" >/dev/null 2>&1 || true
+        set_default_route "$CNI_CONTAINERID" "$jail_id" inet "$gateway"
     fi
     if [ -n "$gateway6" ]; then
         # A link-local gateway is ambiguous without the interface it is on:
@@ -465,7 +505,7 @@ cmd_add() {
         case "$gateway6" in
             fe80:*|FE80:*) [ "${gateway6#*%}" = "$gateway6" ] && gateway6="$gateway6%$ifname" ;;
         esac
-        route -j "$jail_id" add -inet6 default "$gateway6" >/dev/null 2>&1 || true
+        set_default_route "$CNI_CONTAINERID" "$jail_id" inet6 "$gateway6"
     fi
 
     # Configure loopback
