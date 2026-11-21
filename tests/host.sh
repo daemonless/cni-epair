@@ -75,6 +75,58 @@ for a in $(ifconfig ept0 | awk '/member: epair/{print $2}'); do
     [ "$m" = 9000 ] && ok "host end $a $m" || bad "host end $a '$m'"
 done
 
+echo "== default route replaces foreign default, keeps epair default by CNI name"
+dr_cid=$(podman inspect -f '{{.Id}}' ept-mtu)
+dr_jid=$(jid ept-mtu)
+dr_orig=$(cat "/var/run/cni/freebsd-epair/$dr_cid")
+dr_gw_orig=$(cat "/var/run/cni/freebsd-epair/$dr_cid.gw" 2>/dev/null || true)
+dr_conf_z="{\"cniVersion\":\"1.0.0\",\"name\":\"ept-z\",\"type\":\"epair-test\",\"master\":\"ept0\",\"ipam\":{\"type\":\"static\"}}"
+dr_conf_a="{\"cniVersion\":\"1.0.0\",\"name\":\"ept-a\",\"type\":\"epair-test\",\"master\":\"ept0\",\"ipam\":{\"type\":\"static\"}}"
+
+# Case 1: later-sorting network (ept-z > ept-mtu) keeps ept-mtu default.
+if printf '%s\n' "$dr_conf_z" | \
+    CNI_COMMAND=ADD CNI_CONTAINERID="$dr_cid" \
+    CNI_NETNS="$dr_cid" CNI_IFNAME=eth1 \
+    CNI_ARGS="IP=10.251.0.88/24" sh "$PLUGIN" >/dev/null 2>"$ERR"; then
+    gws=$(jexec "$dr_jid" netstat -rn -f inet | awk '$1 == "default" { print $2 }')
+    [ "$gws" = "10.250.0.1" ] && ok "cni later name (ept-z) keeps ept-mtu default (10.250.0.1)" ||
+        bad "expected ept-mtu default 10.250.0.1, got: $(printf '%s' "$gws" | tr '\n' ' ')"
+    printf '%s\n' "$dr_conf_z" | CNI_COMMAND=DEL CNI_CONTAINERID="$dr_cid" CNI_NETNS="$dr_cid" sh "$PLUGIN" >/dev/null 2>&1 || true
+else
+    bad "cni ept-z route check failed: $(cat "$ERR")"
+fi
+
+# Case 1b: earlier-sorting network (ept-a < ept-mtu) replaces ept-mtu default.
+if printf '%s\n' "$dr_conf_a" | \
+    CNI_COMMAND=ADD CNI_CONTAINERID="$dr_cid" \
+    CNI_NETNS="$dr_cid" CNI_IFNAME=eth1 \
+    CNI_ARGS="IP=10.251.0.89/24" sh "$PLUGIN" >/dev/null 2>"$ERR"; then
+    gws=$(jexec "$dr_jid" netstat -rn -f inet | awk '$1 == "default" { print $2 }')
+    [ "$gws" = "10.251.0.1" ] && ok "cni earlier name (ept-a) replaces ept-mtu default (10.251.0.1)" ||
+        bad "expected ept-a default 10.251.0.1, got: $(printf '%s' "$gws" | tr '\n' ' ')"
+    printf '%s\n' "$dr_conf_a" | CNI_COMMAND=DEL CNI_CONTAINERID="$dr_cid" CNI_NETNS="$dr_cid" sh "$PLUGIN" >/dev/null 2>&1 || true
+else
+    bad "cni ept-a route check failed: $(cat "$ERR")"
+fi
+
+# Case 2: foreign default (e.g. private bridge 10.250.0.254) is replaced cleanly.
+rm -f "/var/run/cni/freebsd-epair/$dr_cid.gw"
+route -j "$dr_jid" delete default >/dev/null 2>&1 || true
+route -j "$dr_jid" add default 10.250.0.254 >/dev/null 2>&1
+if printf '%s\n' "$dr_conf_z" | \
+    CNI_COMMAND=ADD CNI_CONTAINERID="$dr_cid" \
+    CNI_NETNS="$dr_cid" CNI_IFNAME=eth1 \
+    CNI_ARGS="IP=10.250.0.88/24" sh "$PLUGIN" >/dev/null 2>"$ERR"; then
+    gws=$(jexec "$dr_jid" netstat -rn -f inet | awk '$1 == "default" { print $2 }')
+    [ "$gws" = "10.250.0.1" ] && ok "foreign default replaced (only 10.250.0.1)" ||
+        bad "expected sole default 10.250.0.1, got: $(printf '%s' "$gws" | tr '\n' ' ')"
+    printf '%s\n' "$dr_conf_z" | CNI_COMMAND=DEL CNI_CONTAINERID="$dr_cid" CNI_NETNS="$dr_cid" sh "$PLUGIN" >/dev/null 2>&1 || true
+else
+    bad "replace foreign default failed: $(cat "$ERR")"
+fi
+printf '%s\n' "$dr_orig" > "/var/run/cni/freebsd-epair/$dr_cid"
+[ -n "$dr_gw_orig" ] && printf '%s\n' "$dr_gw_orig" > "/var/run/cni/freebsd-epair/$dr_cid.gw"
+
 echo "== static address"
 if start ept-ip ept-mtu --ip 10.250.0.77; then
     ifconfig -j "$(jid ept-ip)" eth0 | grep -q 'inet 10\.250\.0\.77 ' && ok "--ip 10.250.0.77 set" ||
