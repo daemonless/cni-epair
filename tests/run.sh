@@ -19,11 +19,21 @@ if [ -n "${FAIL_MATCH:-}" ] && echo "$*" | grep -q -- "$FAIL_MATCH"; then
     exit 1
 fi
 case "$*" in
-"epair create") echo epair0a ;;
+"epair create")
+    if [ -n "${EP_COUNTER_FILE:-}" ]; then
+        n=$(cat "$EP_COUNTER_FILE" 2>/dev/null || echo 1)
+        echo $((n + 1)) > "$EP_COUNTER_FILE"
+        echo "epair${n}a"
+    else
+        echo epair0a
+    fi
+    ;;
 nobridge) exit 1 ;;
 bridge0) printf 'bridge0: flags=8843<UP> metric 0 mtu %s\n\tbridge flags=%s\n' "${BRIDGE_MTU:-1500}" "${BRIDGE_FLAGS:-0}" ;;
 epair0a) printf 'epair0a: flags=8843<UP>\n\tether 02:00:00:00:00:0a\n' ;;
+epair*a) printf '%s: flags=8843<UP>\n\tether 02:00:00:00:00:0a\n' "$*" ;;
 "-j 7 eth0") printf 'eth0: flags=8843<UP>\n\tether 02:00:00:00:00:0b\n' ;;
+"-j 7 eth"*) printf '%s: flags=8843<UP>\n\tether 02:00:00:00:00:0b\n' "${*#-j 7 }" ;;
 esac
 exit 0
 EOF
@@ -120,7 +130,7 @@ called "static: deletes foreign v4 default route" "route -j 7 delete default 10.
 called "static: adds v4 default route" "route -j 7 add default 10.0.0.1"
 not_called "static: does not touch v6 default route" "delete -inet6 default"
 not_called "static: no MTU set on a 1500 bridge" " mtu "
-[ "$(cat "$T/state/$CNI_CONTAINERID")" = epair0a ] && ok "static: state recorded" || bad "static: state recorded"
+[ "$(cat "$T/state/$CNI_CONTAINERID")" = "eth0 epair0a" ] && ok "static: state recorded" || bad "static: state recorded"
 grep -qxF "7 inet 10.0.0.1 t" "$T/state/$CNI_CONTAINERID.gw" && ok "static: gateway and network name recorded" || bad "static: gateway and network name recorded"
 
 rm -f "$T/state/$CNI_CONTAINERID.gw"
@@ -249,13 +259,41 @@ called "cni vlan4->priv->lan86: lan86 replaces vlan4 default" "route -j 7 delete
 called "cni vlan4->priv->lan86: lan86 installs 192.168.86.1" "route -j 7 add default 192.168.86.1"
 
 # --- DEL destroys the epair, removes .gw state, and releases the addresses
-echo epair0a > "$T/state/$CNI_CONTAINERID"
+echo "eth0 epair0a" > "$T/state/$CNI_CONTAINERID"
 run DEL "$(conf '' host-local)"
 [ "$rc" -eq 0 ] && ok "del: exit 0" || bad "del: exit $rc" "$out"
 called "del: epair destroyed" "ifconfig epair0a destroy"
 called "del: addresses released" "host-local DEL"
 [ ! -e "$T/state/$CNI_CONTAINERID" ] && ok "del: state removed" || bad "del: state removed"
 [ ! -e "$T/state/$CNI_CONTAINERID.gw" ] && ok "del: gateway state removed" || bad "del: gateway state removed"
+
+# --- Legacy 1-column state file still cleans up
+echo epair0a > "$T/state/$CNI_CONTAINERID"
+run DEL "$(conf '' host-local)"
+called "del legacy: epair destroyed" "ifconfig epair0a destroy"
+[ ! -e "$T/state/$CNI_CONTAINERID" ] && ok "del legacy: state removed" || bad "del legacy: state removed"
+
+# --- Multi-epair CNI ADD / failed 4th ADD / per-interface DEL
+rm -f "$T/state/$CNI_CONTAINERID" "$T/state/$CNI_CONTAINERID.gw"
+echo 1 > "$T/ep_seq"
+run ADD "$(conf_named vlan5 '' static)" CNI_ARGS="IP=192.168.5.10/24" CNI_IFNAME=eth0 EP_COUNTER_FILE="$T/ep_seq" CURRENT_GW4=""
+run ADD "$(conf_named vlan4 '' static)" CNI_ARGS="IP=192.168.4.10/24" CNI_IFNAME=eth1 EP_COUNTER_FILE="$T/ep_seq" CURRENT_GW4="192.168.5.1"
+run ADD "$(conf_named lan86 '' static)" CNI_ARGS="IP=192.168.86.10/24" CNI_IFNAME=eth2 EP_COUNTER_FILE="$T/ep_seq" CURRENT_GW4="192.168.4.1"
+[ "$(wc -l < "$T/state/$CNI_CONTAINERID" | tr -d ' ')" -eq 3 ] && ok "cni 3-epair: 3 state lines recorded" || bad "cni 3-epair: state lines"
+run ADD "$(conf_named bad4 '' static)" CNI_ARGS="IP=192.168.99.10/24" CNI_IFNAME=eth3 EP_COUNTER_FILE="$T/ep_seq" FAIL_MATCH="vnet"
+[ "$rc" -eq 1 ] && ok "cni 4th failed ADD: exit 1" || bad "cni 4th failed ADD: exit $rc"
+called "cni 4th failed ADD: destroys only epair4a" "ifconfig epair4a destroy"
+[ "$(wc -l < "$T/state/$CNI_CONTAINERID" | tr -d ' ')" -eq 3 ] && ok "cni 4th failed ADD: keeps first 3 state lines" || bad "cni 4th failed ADD: state kept"
+grep -qxF "7 inet 192.168.86.1 lan86" "$T/state/$CNI_CONTAINERID.gw" && ok "cni 4th failed ADD: keeps winning .gw" || bad "cni 4th failed ADD: keeps .gw"
+run DEL "$(conf_named vlan5 '' static)" CNI_IFNAME=eth0
+called "cni multi DEL eth0: destroys epair1a" "ifconfig epair1a destroy"
+not_called "cni multi DEL eth0: spares epair2a" "epair2a destroy"
+[ "$(wc -l < "$T/state/$CNI_CONTAINERID" | tr -d ' ')" -eq 2 ] && ok "cni multi DEL eth0: 2 lines remain" || bad "cni multi DEL eth0: lines remain"
+run DEL "$(conf_named vlan4 '' static)" CNI_IFNAME=eth1
+called "cni multi DEL eth1: destroys epair2a" "ifconfig epair2a destroy"
+run DEL "$(conf_named lan86 '' static)" CNI_IFNAME=eth2
+called "cni multi DEL eth2: destroys epair3a" "ifconfig epair3a destroy"
+[ ! -e "$T/state/$CNI_CONTAINERID" ] && [ ! -e "$T/state/$CNI_CONTAINERID.gw" ] && ok "cni multi DEL: all state removed after last DEL" || bad "cni multi DEL: state removed"
 
 run VERSION "{}"
 check "version: lists 1.0.0" '.supportedVersions | index("1.0.0")'
@@ -302,22 +340,45 @@ called "netavark static: deletes foreign default route" "route -j 7 delete defau
 called "netavark static: the network's gateway, not a guess" "route -j 7 add default 10.0.0.254"
 not_called "netavark static: no DHCP request" "dhclient"
 
+rm -f "$T/state/$ID" "$T/state/$ID.gw"
+nv setup "$ID" "$(nvnet ',"subnets":[{"gateway":"fd00:5::1","subnet":"fd00:5::/64"}]' ',"static_ips":["fd00:5::2"],"static_mac":null')" CURRENT_GW6=""
+[ "$rc" -eq 0 ] && ok "netavark v6-only static: exit 0" || bad "netavark v6-only static: exit $rc" "$out"
+called "netavark v6-only static: sets v6 address" "ifconfig -j 7 eth0 inet6 fd00:5::2/64"
+called "netavark v6-only static: sets v6 gateway" "route -j 7 add -inet6 default fd00:5::1"
+not_called "netavark v6-only static: no DHCP request" "dhclient"
+
+rm -f "$T/state/$CNI_CONTAINERID" "$T/state/$CNI_CONTAINERID.gw"
+run ADD "$(conf '' static)" CNI_ARGS="IP=fd00:5::10/64" CNI_IFNAME=eth0 CNI_EPAIR_GATEWAY6="fe80::1" CURRENT_GW6=""
+[ "$rc" -eq 0 ] && ok "cni v6 link-local gw: exit 0" || bad "cni v6 link-local gw: exit $rc" "$out"
+check "cni v6 link-local gw: CNI JSON omits %zone" '.ips[0].gateway == "fe80::1"'
+called "cni v6 link-local gw: route uses %eth0" "route -j 7 add -inet6 default fe80::1%eth0"
+
 # Multi-LAN and mixed under netavark mode: first attached wins (even if a later name sorts first)
-nvnet_named() { echo "{\"container_id\":\"$ID\",\"container_name\":\"Web_App\",\"network\":{\"driver\":\"epair\",\"name\":\"$1\",\"network_interface\":\"bridge0\"$2},\"network_options\":{\"interface_name\":\"eth0\"$3}}"; }
-rm -f "$T/state/$ID.gw"
-nv setup "$ID" "$(nvnet_named nv-vlan4 ',"subnets":[{"gateway":"192.168.4.1","subnet":"192.168.4.0/24"}]' ',"static_ips":["192.168.4.9"],"static_mac":null')" CURRENT_GW4="10.89.0.1"
+nvnet_named_iface() { echo "{\"container_id\":\"$ID\",\"container_name\":\"Web_App\",\"network\":{\"driver\":\"epair\",\"name\":\"$1\",\"network_interface\":\"bridge0\"$2},\"network_options\":{\"interface_name\":\"$3\"$4}}"; }
+nvnet_named() { nvnet_named_iface "$1" "$2" "eth0" "$3"; }
+rm -f "$T/state/$ID" "$T/state/$ID.gw"
+echo 10 > "$T/ep_seq"
+nv setup "$ID" "$(nvnet_named_iface nv-vlan4 ',"subnets":[{"gateway":"192.168.4.1","subnet":"192.168.4.0/24"}]' eth0 ',"static_ips":["192.168.4.9"],"static_mac":null')" CURRENT_GW4="10.89.0.1" EP_COUNTER_FILE="$T/ep_seq"
 called "netavark priv->vlan4->lan86: vlan4 replaces 10.89.0.1" "route -j 7 delete default 10.89.0.1"
 called "netavark priv->vlan4->lan86: vlan4 adds 192.168.4.1" "route -j 7 add default 192.168.4.1"
-nv setup "$ID" "$(nvnet_named nv-lan86 ',"subnets":[{"gateway":"192.168.86.1","subnet":"192.168.86.0/24"}]' ',"static_ips":["192.168.86.9"],"static_mac":null')" CURRENT_GW4="192.168.4.1"
+nv setup "$ID" "$(nvnet_named_iface nv-lan86 ',"subnets":[{"gateway":"192.168.86.1","subnet":"192.168.86.0/24"}]' eth1 ',"static_ips":["192.168.86.9"],"static_mac":null')" CURRENT_GW4="192.168.4.1" EP_COUNTER_FILE="$T/ep_seq"
 not_called "netavark priv->vlan4->lan86: lan86 keeps first attached (vlan4)" "route -j 7 delete"
 not_called "netavark priv->vlan4->lan86: lan86 adds nothing" "route -j 7 add default"
+[ "$(wc -l < "$T/state/$ID" | tr -d ' ')" -eq 2 ] && ok "netavark 2-epair: 2 state lines recorded" || bad "netavark 2-epair: state lines"
+nv teardown "$ID" "$(nvnet_named_iface nv-vlan4 '' eth0 '')"
+[ "$rc" -eq 0 ] && ok "netavark multi teardown eth0: exit 0" || bad "netavark multi teardown eth0: exit $rc"
+called "netavark multi teardown eth0: destroys epair10a" "ifconfig epair10a destroy"
+not_called "netavark multi teardown eth0: spares epair11a" "epair11a destroy"
+nv teardown "$ID" "$(nvnet_named_iface nv-lan86 '' eth1 '')"
+called "netavark multi teardown eth1: destroys epair11a" "ifconfig epair11a destroy"
+[ ! -e "$T/state/$ID" ] && [ ! -e "$T/state/$ID.gw" ] && ok "netavark multi teardown: state removed after last DEL" || bad "netavark multi teardown: state removed"
 
 nv setup "$ID" "$(nvnet '' ',"static_ips":["10.0.0.9"]')" FAIL_MATCH="vnet"
 [ "$rc" -eq 1 ] && ok "netavark failed move: exit 1" || bad "netavark failed move: exit $rc" "$out"
 check "netavark failed move: the reason, as netavark reads errors" '.error | test("move epair0b")'
 called "netavark failed move: epair destroyed" "ifconfig epair0a destroy"
 
-echo epair0a > "$T/state/$ID"
+echo "eth0 epair0a" > "$T/state/$ID"
 nv teardown "$ID" "$(nvnet '' '')"
 [ "$rc" -eq 0 ] && ok "netavark teardown: exit 0" || bad "netavark teardown: exit $rc" "$out"
 called "netavark teardown: epair destroyed" "ifconfig epair0a destroy"

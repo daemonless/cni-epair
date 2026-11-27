@@ -179,7 +179,7 @@ address silently.
 
 | path | purpose |
 |---|---|
-| `/var/run/cni/freebsd-epair` | container id → epair name, so `DEL` can find it |
+| `/var/run/cni/freebsd-epair` | `<container_id>` holds `<ifname> <epair_a>` per attached interface so `DEL`/`teardown` destroys every epair cleanly |
 | `/var/log/cni-freebsd-epair.log` | all logging; stderr is redirected here so it cannot corrupt the JSON podman parses |
 
 These keep their original `freebsd-epair` spelling even though the plugin is
@@ -201,12 +201,13 @@ network. CI runs it on every push.
 DHCP_BRIDGE=lanbridge sh tests/host.sh   # as root, on a test machine
 ```
 
-The same plugin on a real FreeBSD host with podman: MTU on both ends,
-host-local and static addresses, errors as podman shows them, a DHCP lease
-and its DNS server, teardown. It installs the plugin as `epair-test` on a
-bridge of its own (`ept0`), so an installed `epair` and its networks are
-untouched, and removes everything on exit. Without `DHCP_BRIDGE` the DHCP
-check is skipped.
+The same plugin on a real FreeBSD host with podman (`BACKEND` auto-detects
+`cni` or `netavark`, or set `BACKEND=cni|netavark`): MTU on both ends,
+host-local and static addresses, multi-network default route and teardown,
+errors as podman shows them, a DHCP lease and its DNS server, teardown. It
+installs the plugin as `epair-test` on a bridge of its own (`ept0`), so an
+installed `epair` and its networks are untouched, and removes everything on exit.
+Without `DHCP_BRIDGE` the DHCP check is skipped.
 
 ## netavark
 
@@ -296,9 +297,6 @@ why the plugin needs FreeBSD 14.0 or newer: `route -j` is not in 13.
 
 ## Known limitations
 
-- State is keyed by container id alone, so a container attached to two epair
-  networks records only one of them. Tearing such a container down removes the
-  wrong interface and leaks the other.
 - When a static IP arrives via `CNI_ARGS` rather than IPAM, the gateway is
   guessed as `.1` of that subnet and a missing prefix is assumed to be `/24`.
 - `get_jail_id` falls back to progressively looser matches against `jls` output,

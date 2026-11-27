@@ -110,17 +110,70 @@ get_jail_id() {
 
 # Track epair and installed default routes for cleanup and multi-network runs
 save_epair() {
-    local container_id="$1"
-    local epair_a="$2"
+    local container_id="$1" ifname="$2" epair_a="$3"
     local state_dir="${CNI_EPAIR_STATE:-/var/run/cni/freebsd-epair}"
+    local file="$state_dir/$container_id" tmp=""
     mkdir -p "$state_dir"
-    echo "$epair_a" > "$state_dir/$container_id"
+    if [ -f "$file" ]; then
+        tmp=$(awk -v iface="$ifname" 'NF >= 2 && $1 == iface { next } { print }' "$file" 2>/dev/null || true)
+    fi
+    {
+        [ -n "$tmp" ] && printf '%s\n' "$tmp"
+        printf '%s %s\n' "$ifname" "$epair_a"
+    } > "$file"
 }
 
 get_epair() {
-    local container_id="$1"
+    local container_id="$1" ifname="${2:-}"
     local state_dir="${CNI_EPAIR_STATE:-/var/run/cni/freebsd-epair}"
-    cat "$state_dir/$container_id" 2>/dev/null
+    local file="$state_dir/$container_id"
+    [ -f "$file" ] || return 0
+    if [ -n "$ifname" ]; then
+        awk -v iface="$ifname" '
+            NF >= 2 && $1 == iface { print $2; found=1; exit }
+            END { if (!found) exit 1 }
+        ' "$file" 2>/dev/null ||
+            awk 'NF == 1 { print $1; exit }' "$file" 2>/dev/null || true
+    else
+        awk '{ print (NF >= 2 ? $2 : $1) }' "$file" 2>/dev/null || true
+    fi
+}
+
+remove_epair_entry() {
+    local container_id="$1" ifname="${2:-}" net_name="${3:-}"
+    local state_dir="${CNI_EPAIR_STATE:-/var/run/cni/freebsd-epair}"
+    local file="$state_dir/$container_id" gw_file="$state_dir/$container_id.gw"
+    local tmp="" gw_tmp=""
+    if [ -f "$file" ]; then
+        if [ -n "$ifname" ]; then
+            tmp=$(awk -v iface="$ifname" '
+                { lines[NR] = $0; nf[NR] = NF; if (NF >= 2 && $1 == iface) match_i = NR }
+                END {
+                    if (!match_i) {
+                        for (i = 1; i <= NR; i++) if (nf[i] == 1) { match_i = i; break }
+                    }
+                    for (i = 1; i <= NR; i++) if (i != match_i) print lines[i]
+                }
+            ' "$file" 2>/dev/null || true)
+        fi
+        if [ -n "$tmp" ]; then
+            printf '%s\n' "$tmp" > "$file"
+        else
+            rm -f "$file" 2>/dev/null || true
+        fi
+    fi
+    if [ -f "$gw_file" ]; then
+        if [ ! -f "$file" ]; then
+            rm -f "$gw_file" 2>/dev/null || true
+        elif [ -n "$net_name" ]; then
+            gw_tmp=$(awk -v n="$net_name" '$4 != n' "$gw_file" 2>/dev/null || true)
+            if [ -n "$gw_tmp" ]; then
+                printf '%s\n' "$gw_tmp" > "$gw_file"
+            else
+                rm -f "$gw_file" 2>/dev/null || true
+            fi
+        fi
+    fi
 }
 
 save_gateway() {
@@ -442,15 +495,17 @@ cmd_add() {
     [ -z "$jail_id" ] && die "Could not find jail for container $CNI_CONTAINERID"
     log "ADD: jail_id=$jail_id"
 
+    local ifname="${CNI_IFNAME:-eth0}"
+
     # No lock: the kernel hands out the unit, so parallel creates never collide.
     local epair_a
     epair_a=$(ifconfig epair create) || die "could not create an epair"
 
     local epair_b=$(echo "$epair_a" | sed 's/a$/b/')
-    log "ADD: created $epair_a / $epair_b"
+    log "ADD: created $epair_a / $epair_b for $ifname"
 
     # Save for cleanup
-    save_epair "$CNI_CONTAINERID" "$epair_a"
+    save_epair "$CNI_CONTAINERID" "$ifname" "$epair_a"
 
     # From here on a failure must not be reported as success: podman would
     # believe the container holds $ip while it has no working interface at all,
@@ -461,7 +516,7 @@ cmd_add() {
     fail_add() {
         log "ADD: FAILED: $1"
         ifconfig "$epair_a" destroy 2>/dev/null || true
-        del_epair "$CNI_CONTAINERID"
+        remove_epair_entry "$CNI_CONTAINERID" "$ifname" ""
         die "$1"
     }
 
@@ -505,7 +560,6 @@ cmd_add() {
         fail_add "could not move $epair_b into jail $jail_id"
 
     # Configure jail side (redirect output to avoid polluting stdout)
-    local ifname="${CNI_IFNAME:-eth0}"
     ifconfig -j "$jail_id" "$epair_b" name "$ifname" >/dev/null 2>&1 ||
         fail_add "could not rename $epair_b to $ifname in jail $jail_id"
 
@@ -538,11 +592,12 @@ cmd_add() {
     if [ -n "$gateway6" ]; then
         # A link-local gateway is ambiguous without the interface it is on:
         # `route add -inet6 default fe80::1` fails, fe80::1%eth0 works. Routers
-        # commonly advertise exactly this.
-        case "$gateway6" in
-            fe80:*|FE80:*) [ "${gateway6#*%}" = "$gateway6" ] && gateway6="$gateway6%$ifname" ;;
+        # commonly advertise exactly this. Keep $gateway6 zone-free for CNI JSON.
+        local gw6_route="$gateway6"
+        case "$gw6_route" in
+            fe80:*|FE80:*) [ "${gw6_route#*%}" = "$gw6_route" ] && gw6_route="$gw6_route%$ifname" ;;
         esac
-        set_default_route "$CNI_CONTAINERID" "$jail_id" inet6 "$gateway6" "$net_name"
+        set_default_route "$CNI_CONTAINERID" "$jail_id" inet6 "$gw6_route" "$net_name"
     fi
 
     # Configure loopback
@@ -596,19 +651,27 @@ EOF
 
 cmd_del() {
     local config="$1"
+    local ifname="${CNI_IFNAME:-}"
+    local net_name=$(json_get_nested "$config" "name")
 
-    log "DEL: CNI_CONTAINERID=$CNI_CONTAINERID"
+    log "DEL: CNI_CONTAINERID=$CNI_CONTAINERID CNI_IFNAME=$ifname"
 
-    # Get saved epair
-    local epair_a=$(get_epair "$CNI_CONTAINERID")
-
-    if [ -n "$epair_a" ]; then
-        # Destroy epair (destroys both ends)
-        ifconfig "$epair_a" destroy 2>/dev/null || true
-        log "DEL: destroyed $epair_a"
+    local epair_a
+    if [ -n "$ifname" ]; then
+        epair_a=$(get_epair "$CNI_CONTAINERID" "$ifname")
+        if [ -n "$epair_a" ]; then
+            ifconfig "$epair_a" destroy 2>/dev/null || true
+            log "DEL: destroyed $epair_a ($ifname)"
+        fi
+        remove_epair_entry "$CNI_CONTAINERID" "$ifname" "$net_name"
+    else
+        for epair_a in $(get_epair "$CNI_CONTAINERID"); do
+            [ -n "$epair_a" ] || continue
+            ifconfig "$epair_a" destroy 2>/dev/null || true
+            log "DEL: destroyed $epair_a"
+        done
+        del_epair "$CNI_CONTAINERID"
     fi
-
-    del_epair "$CNI_CONTAINERID"
 
     # Hand the addresses back. ADD delegates allocation to the IPAM plugin, and
     # DEL never told it the container was gone -- so host-local kept every
@@ -748,6 +811,7 @@ nv_setup() {
     for v in $(printf '%s' "$in" | grep -o '"static_ips"[[:space:]]*:[[:space:]]*\[[^]]*\]' | grep -o '"[0-9a-fA-F:.]*"' | tr -d '"'); do
         if is_v6 "$v"; then
             args="$args;IP=$v/$pfx6"
+            ipam=static
         else
             args="$args;IP=$v/$pfx4"
             ipam=static
@@ -788,10 +852,12 @@ nv_setup() {
 }
 
 nv_teardown() {
-    local id="$1"
+    local id="$1" in="$2"
     [ -n "$id" ] || nv_die "teardown needs the container id"
-    printf '%s' '{"cniVersion":"1.0.0","type":"epair","ipam":{"type":"none"}}' |
-        CNI_COMMAND=DEL CNI_CONTAINERID="$id" "$0" >/dev/null
+    local ifname=$(nv_str "$in" interface_name)
+    local net_name=$(nv_str "$in" name)
+    printf '{"cniVersion":"1.0.0","name":"%s","type":"epair","ipam":{"type":"none"}}\n' "$net_name" |
+        CNI_COMMAND=DEL CNI_CONTAINERID="$id" CNI_IFNAME="$ifname" "$0" >/dev/null
 }
 
 case "${1:-}" in
@@ -810,8 +876,7 @@ case "${1:-}" in
         ;;
     teardown)
         log "netavark: teardown $2"
-        cat >/dev/null
-        nv_teardown "$2"
+        nv_teardown "$2" "$(read_config)"
         exit 0
         ;;
 esac
